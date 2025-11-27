@@ -16,7 +16,7 @@ st.title("📈 주식 기술적 지표 필터링 시스템")
 # 요청하신 링크의 ID: 1NVThO1z2HHF0TVXVRGmbVsSU_Svyjg8fxd7E90z2o8A
 SHEET_ID = '1NVThO1z2HHF0TVXVRGmbVsSU_Svyjg8fxd7E90z2o8A'
 GID = '0' 
-CSV_URL = f'https://docs.google.com/spreadsheets/d/{target}/export?format=csv&gid={GID}'
+CSV_URL = f'https://docs.google.com/spreadsheets/d/target/export?format=csv&gid={GID}'
 
 # ==========================================
 # 3. 함수 정의

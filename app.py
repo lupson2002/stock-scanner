@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 from supabase import create_client, Client
+# 수학/과학 라이브러리 (패턴 분석용)
 from scipy.signal import argrelextrema
 
 # =========================================================
@@ -31,10 +32,10 @@ supabase = init_supabase()
 # 2. 구글 시트 연결 설정
 # ==========================================
 SHEET_ID = '1NVThO1z2HHF0TVXVRGmbVsSU_Svyjg8fxd7E90z2o8A'
-# 개별 종목 탭 (기존)
+# 개별 종목 탭
 STOCK_GID = '0' 
 STOCK_CSV_URL = f'https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={STOCK_GID}'
-# ETF 탭 (신규)
+# ETF 탭
 ETF_GID = '2023286696'
 ETF_CSV_URL = f'https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={ETF_GID}'
 
@@ -52,10 +53,8 @@ def get_tickers_from_sheet():
         return []
 
 def get_etfs_from_sheet():
-    """ETF 목록 읽어오기 (A열:티커, B열:이름 가정)"""
     try:
         df = pd.read_csv(ETF_CSV_URL, header=None)
-        # A열은 티커, B열이 있다면 이름으로 사용
         etf_list = []
         for index, row in df.iterrows():
             ticker = str(row[0]).strip()
@@ -77,39 +76,29 @@ def get_unique_tickers_from_db():
     except Exception as e: return []
 
 def remove_duplicates_from_db():
-    """DB에서 중복된 티커 제거 (최신 1개만 유지)"""
     if not supabase: return
     try:
-        # 1. 모든 데이터 가져오기 (id, ticker, created_at)
         response = supabase.table("history").select("id, ticker, created_at").order("created_at", desc=True).execute()
         data = response.data
-        
         if not data:
             st.warning("데이터가 없습니다.")
             return
 
         seen_tickers = set()
         ids_to_remove = []
-
-        # 2. 최신순으로 순회하며 중복 체크
         for row in data:
             ticker = row['ticker']
             if ticker in seen_tickers:
-                # 이미 본 티커라면(즉, 더 최신 데이터가 있다면) 이 행은 삭제 대상
                 ids_to_remove.append(row['id'])
             else:
                 seen_tickers.add(ticker)
         
-        # 3. 삭제 실행
         if ids_to_remove:
-            # Supabase delete는 한 번에 여러 개 삭제 가능 (in 조건 사용 불가 시 반복문)
-            # 안전하게 반복문으로 처리
             for pid in ids_to_remove:
                 supabase.table("history").delete().eq("id", pid).execute()
             st.success(f"🧹 중복된 {len(ids_to_remove)}개 데이터를 삭제했습니다.")
         else:
             st.info("삭제할 중복 데이터가 없습니다.")
-            
     except Exception as e:
         st.error(f"중복 제거 실패: {e}")
 
@@ -130,17 +119,50 @@ def smart_download(ticker, interval="1d", period="2y"):
             continue
     return ticker, pd.DataFrame()
 
+# [수정된 함수] 섹터/ETF 이름 스마트 찾기
 def get_stock_sector(ticker):
+    """
+    1. ETF인 경우 -> ETF 이름 반환
+    2. 주식인 경우 -> 섹터 반환 (번역)
+    3. 정보가 없는 경우 -> 산업군(Industry) 또는 종목명 반환
+    """
     try:
-        info = yf.Ticker(ticker).info
-        sector = info.get('sector', 'N/A')
+        # yfinance 객체 생성
+        tick = yf.Ticker(ticker)
+        info = tick.info
+        
+        # 1. ETF 여부 확인 (quoteType이 ETF거나, fundFamily가 있으면 ETF 가능성 높음)
+        quote_type = info.get('quoteType', '').upper()
+        
+        if 'ETF' in quote_type or 'FUND' in quote_type:
+            # ETF면 짧은 이름(Short Name)을 섹터 대신 반환
+            name = info.get('shortName', '')
+            if not name:
+                name = info.get('longName', 'ETF')
+            return f"[ETF] {name}"
+
+        # 2. 일반 주식 섹터 확인
+        sector = info.get('sector', '')
+        
+        # 섹터 정보가 비어있으면 산업(Industry) 확인
+        if not sector:
+            sector = info.get('industry', '')
+            
+        # 그래도 없으면 종목명 반환 (최후의 수단)
+        if not sector:
+            return info.get('shortName', 'Unknown')
+
+        # 3. 한글 번역 매핑
         translations = {
             'Technology': '기술', 'Healthcare': '헬스케어', 'Financial Services': '금융',
             'Consumer Cyclical': '임의소비재', 'Industrials': '산업재', 'Basic Materials': '소재',
             'Energy': '에너지', 'Utilities': '유틸리티', 'Real Estate': '부동산',
-            'Communication Services': '통신', 'Consumer Defensive': '필수소비재'
+            'Communication Services': '통신', 'Consumer Defensive': '필수소비재',
+            'Semiconductors': '반도체', 'Software': '소프트웨어', 'Biotechnology': '바이오'
         }
+        
         return translations.get(sector, sector)
+        
     except:
         return "Unknown"
 
@@ -228,19 +250,16 @@ def calculate_common_indicators(df, is_weekly=False):
     return df
 
 def analyze_sector_trend():
-    """ETF 섹터 추세 및 모멘텀 분석"""
     etfs = get_etfs_from_sheet()
     if not etfs:
         st.warning("ETF 목록을 불러오지 못했습니다.")
         return []
 
-    # SPY(벤치마크) 다운로드
     spy_ticker, spy_df = smart_download("SPY", interval="1d", period="2y")
     if len(spy_df) < 260:
         st.error("SPY 데이터 부족으로 분석 불가")
         return []
 
-    # SPY 기간별 수익률 계산
     spy_close = spy_df['Close']
     spy_r1m = spy_close.pct_change(21).iloc[-1]
     spy_r3m = spy_close.pct_change(63).iloc[-1]
@@ -248,8 +267,6 @@ def analyze_sector_trend():
     spy_r12m = spy_close.pct_change(252).iloc[-1]
 
     results = []
-    
-    # 각 ETF 분석
     progress_bar = st.progress(0)
     for i, (ticker, name) in enumerate(etfs):
         progress_bar.progress((i + 1) / len(etfs))
@@ -257,7 +274,6 @@ def analyze_sector_trend():
         real_ticker, df = smart_download(ticker, interval="1d", period="2y")
         if len(df) < 260: continue
         
-        # EMA 계산
         close = df['Close']
         ema20 = close.ewm(span=20, adjust=False).mean().iloc[-1]
         ema60 = close.ewm(span=60, adjust=False).mean().iloc[-1]
@@ -265,24 +281,20 @@ def analyze_sector_trend():
         ema200 = close.ewm(span=200, adjust=False).mean().iloc[-1]
         curr_price = close.iloc[-1]
         
-        # 정배열 여부 (현재가 > 모든 이평선)
         is_aligned = (curr_price > ema20) and (curr_price > ema60) and (curr_price > ema100) and (curr_price > ema200)
         alignment_str = "⭐ 정배열" if is_aligned else "-"
         
-        # 수익률 계산
         r1m = close.pct_change(21).iloc[-1]
         r3m = close.pct_change(63).iloc[-1]
         r6m = close.pct_change(126).iloc[-1]
         r12m = close.pct_change(252).iloc[-1]
         
-        # RS (상대 강도) 점수 계산 (각 25% 비중)
-        # RS = (ETF수익률 - SPY수익률) * 0.25 합산
         rs_score = (
             0.25 * (r1m - spy_r1m) +
             0.25 * (r3m - spy_r3m) +
             0.25 * (r6m - spy_r6m) +
             0.25 * (r12m - spy_r12m)
-        ) * 100 # 보기 좋게 100 곱함
+        ) * 100
 
         results.append({
             "ETF": real_ticker,
@@ -293,18 +305,14 @@ def analyze_sector_trend():
         })
     
     progress_bar.empty()
-    
-    # 점수 높은 순 정렬 및 상위 10개
     df_res = pd.DataFrame(results)
     if not df_res.empty:
         df_res = df_res.sort_values(by="모멘텀점수", ascending=False).head(10)
-        # 포맷팅
         df_res['모멘텀점수'] = df_res['모멘텀점수'].apply(lambda x: f"{x:.2f}")
         df_res['현재가'] = df_res['현재가'].apply(lambda x: f"{x:,.2f}")
     
     return df_res
 
-# 패턴 분석 함수들 (컵핸들, 역헤드앤숄더, 눌림목)
 def check_cup_handle_pattern(df):
     if len(df) < 70: return False, None
     df = df.copy()
@@ -322,6 +330,7 @@ def check_cup_handle_pattern(df):
     right_peak_window = subset.iloc[-15:-1] 
     if len(right_peak_window) == 0: return False, "데이터 부족"
     right_peak_price = right_peak_window['High'].max()
+    
     right_peak_idx = right_peak_window['High'].idxmax()
     
     left_search_area = subset[subset.index < right_peak_idx].iloc[:-7]
@@ -441,7 +450,6 @@ if not supabase: st.warning("⚠️ DB 연결 키 오류")
 tab1, tab2 = st.tabs(["📊 신규 종목 발굴", "📉 저장된 종목 눌림목 찾기"])
 
 with tab1:
-    # 버튼 5개 배치 (ETF 분석 추가)
     cols = st.columns(5)
     
     # [NEW] ETF 섹터 추세 확인
@@ -619,7 +627,6 @@ with tab2:
                     cond = ""
                     if curr['MACD_V'] > 60: cond = "🔥 공격적 추세"
                     
-                    # 20일선 눌림목
                     is_pullback, details = check_pullback_pattern(df)
                     if is_pullback: cond = f"📉 {details['pattern']}"
 

@@ -4,7 +4,6 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 from supabase import create_client, Client
-# 수학/과학 라이브러리 (패턴 분석용)
 from scipy.signal import argrelextrema
 
 # =========================================================
@@ -17,7 +16,7 @@ SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJ
 # 1. 페이지 설정 및 DB 연결
 # ==========================================
 st.set_page_config(page_title="Pro 주식 검색기", layout="wide")
-st.title("📈 Pro 주식 검색기: 섹터 모멘텀 & 기술적 패턴")
+st.title("📈 Pro 주식 검색기: 섹터/이름 & BW 정밀 분석")
 
 @st.cache_resource
 def init_supabase():
@@ -32,10 +31,8 @@ supabase = init_supabase()
 # 2. 구글 시트 연결 설정
 # ==========================================
 SHEET_ID = '1NVThO1z2HHF0TVXVRGmbVsSU_Svyjg8fxd7E90z2o8A'
-# 개별 종목 탭
 STOCK_GID = '0' 
 STOCK_CSV_URL = f'https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={STOCK_GID}'
-# ETF 탭
 ETF_GID = '2023286696'
 ETF_CSV_URL = f'https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={ETF_GID}'
 
@@ -119,48 +116,45 @@ def smart_download(ticker, interval="1d", period="2y"):
             continue
     return ticker, pd.DataFrame()
 
-# [수정된 함수] 섹터/ETF 이름 스마트 찾기
+# [업데이트] 섹터 정보 없으면 기업 이름이라도 가져오는 함수
 def get_stock_sector(ticker):
-    """
-    1. ETF인 경우 -> ETF 이름 반환
-    2. 주식인 경우 -> 섹터 반환 (번역)
-    3. 정보가 없는 경우 -> 산업군(Industry) 또는 종목명 반환
-    """
     try:
-        # yfinance 객체 생성
         tick = yf.Ticker(ticker)
         info = tick.info
         
-        # 1. ETF 여부 확인 (quoteType이 ETF거나, fundFamily가 있으면 ETF 가능성 높음)
-        quote_type = info.get('quoteType', '').upper()
-        
-        if 'ETF' in quote_type or 'FUND' in quote_type:
-            # ETF면 짧은 이름(Short Name)을 섹터 대신 반환
-            name = info.get('shortName', '')
-            if not name:
-                name = info.get('longName', 'ETF')
-            return f"[ETF] {name}"
-
-        # 2. 일반 주식 섹터 확인
+        # 1순위: 섹터 (Sector)
         sector = info.get('sector', '')
         
-        # 섹터 정보가 비어있으면 산업(Industry) 확인
+        # 2순위: 산업 (Industry)
         if not sector:
             sector = info.get('industry', '')
             
-        # 그래도 없으면 종목명 반환 (최후의 수단)
+        # 3순위: 카테고리 (Category - ETF인 경우)
         if not sector:
-            return info.get('shortName', 'Unknown')
+            sector = info.get('category', '')
 
-        # 3. 한글 번역 매핑
+        # 4순위: 짧은 이름 (Short Name) - 예: Samsung Elec
+        if not sector:
+            sector = info.get('shortName', '')
+            
+        # 5순위: 긴 이름 (Long Name)
+        if not sector:
+            sector = info.get('longName', '')
+
+        # 다 없으면 Unknown
+        if not sector:
+            return "Unknown"
+
+        # 한글 번역 매핑 (주요 섹터만)
         translations = {
             'Technology': '기술', 'Healthcare': '헬스케어', 'Financial Services': '금융',
             'Consumer Cyclical': '임의소비재', 'Industrials': '산업재', 'Basic Materials': '소재',
             'Energy': '에너지', 'Utilities': '유틸리티', 'Real Estate': '부동산',
             'Communication Services': '통신', 'Consumer Defensive': '필수소비재',
-            'Semiconductors': '반도체', 'Software': '소프트웨어', 'Biotechnology': '바이오'
+            'Semiconductors': '반도체'
         }
         
+        # 번역된 게 있으면 반환, 없으면 그대로(영어 이름 등) 반환
         return translations.get(sector, sector)
         
     except:
@@ -173,14 +167,15 @@ def save_to_supabase(data_list, strategy_name):
 
     rows_to_insert = []
     for item in data_list:
+        # DB 저장 시에는 핵심 데이터만 깔끔하게 저장
         rows_to_insert.append({
             "ticker": str(item['종목코드']),
             "sector": str(item.get('섹터', 'Unknown')),
             "price": str(item['현재가']).replace(',', ''),
             "strategy": strategy_name,
             "high_date": str(item.get('현52주신고가일', '')),
-            "bw": str(item.get('BW_Value', '')),
-            "macd_v": str(item.get('MACD_V_Value', ''))
+            "bw": str(item.get('BW_Value', '')), # 숫자값
+            "macd_v": str(item.get('MACD_V_Value', '')) # 숫자값
         })
     
     try:
@@ -242,7 +237,6 @@ def calculate_common_indicators(df, is_weekly=False):
     roll_flat = df['Vol_Flat'].rolling(window=20).sum()
     df['VR20'] = ((roll_up + roll_flat/2) / (roll_down + roll_flat/2 + 1e-9)) * 100
     
-    # 일봉 눌림목용 EMA
     df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
     df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
     df['VolSMA20'] = df['Volume'].rolling(window=20).mean()
@@ -270,7 +264,6 @@ def analyze_sector_trend():
     progress_bar = st.progress(0)
     for i, (ticker, name) in enumerate(etfs):
         progress_bar.progress((i + 1) / len(etfs))
-        
         real_ticker, df = smart_download(ticker, interval="1d", period="2y")
         if len(df) < 260: continue
         
@@ -297,11 +290,7 @@ def analyze_sector_trend():
         ) * 100
 
         results.append({
-            "ETF": real_ticker,
-            "ETF명": name,
-            "모멘텀점수": rs_score,
-            "추세": alignment_str,
-            "현재가": curr_price
+            "ETF": real_ticker, "ETF명": name, "모멘텀점수": rs_score, "추세": alignment_str, "현재가": curr_price
         })
     
     progress_bar.empty()
@@ -310,7 +299,6 @@ def analyze_sector_trend():
         df_res = df_res.sort_values(by="모멘텀점수", ascending=False).head(10)
         df_res['모멘텀점수'] = df_res['모멘텀점수'].apply(lambda x: f"{x:.2f}")
         df_res['현재가'] = df_res['현재가'].apply(lambda x: f"{x:,.2f}")
-    
     return df_res
 
 def check_cup_handle_pattern(df):
@@ -332,11 +320,9 @@ def check_cup_handle_pattern(df):
     right_peak_price = right_peak_window['High'].max()
     
     right_peak_idx = right_peak_window['High'].idxmax()
-    
     left_search_area = subset[subset.index < right_peak_idx].iloc[:-7]
     if len(left_search_area) == 0: return False, "왼쪽 고점 없음"
     left_peak_price = left_search_area['High'].max()
-    left_peak_idx = left_search_area['High'].idxmax()
     
     if not (0.90 * left_peak_price <= right_peak_price <= 1.10 * left_peak_price): return False, "고점 불일치"
     
@@ -454,13 +440,13 @@ with tab1:
     
     # [NEW] ETF 섹터 추세 확인
     if cols[0].button("🌍 추세 섹터 확인"):
-        st.info("ETF 섹터 추세 및 RS 모멘텀을 분석합니다... (시간이 좀 걸립니다)")
+        st.info("ETF 섹터 추세 및 RS 모멘텀을 분석합니다...")
         df_sector = analyze_sector_trend()
         if not df_sector.empty:
-            st.success("✅ 상위 10개 주도 섹터 (모멘텀 순)")
+            st.success("✅ 상위 10개 주도 섹터")
             st.dataframe(df_sector, use_container_width=True)
         else:
-            st.warning("분석할 ETF 데이터가 없거나 SPY 데이터를 가져오지 못했습니다.")
+            st.warning("분석할 데이터가 부족합니다.")
 
     # [A] 일봉 분석
     if cols[1].button("🚀 일봉 분석"):
@@ -482,12 +468,23 @@ with tab1:
                         sector = get_stock_sector(real_ticker)
                         window_52w = df.iloc[-252:]
                         curr_high_date = window_52w['Close'].idxmax().strftime('%Y-%m-%d')
-                        bw_str = f"{curr['BandWidth']:.4f}"
-                        if curr['BandWidth'] < 0.25: bw_str += " (low_vol)"
+                        
+                        # [NEW] BW 분석
+                        bw_curr = curr['BandWidth']
+                        bw_past = df['BandWidth'].iloc[-21] # 20일 전
+                        bw_diff = bw_past - bw_curr
+                        bw_status = "감소" if bw_diff > 0 else "증가"
+                        
+                        bw_str = f"{bw_curr:.4f}"
+                        if bw_curr < 0.25: bw_str += " (low_vol)"
+                        
                         results.append({
                             '종목코드': real_ticker, '섹터': sector, '현재가': f"{curr['Close']:,.0f}",
-                            '현52주신고가일': curr_high_date, 'BW': bw_str,
-                            'BW_Value': f"{curr['BandWidth']:.4f}",
+                            '현52주신고가일': curr_high_date, 
+                            'BW현재': bw_str,
+                            'BW(20일전)': f"{bw_past:.4f}",
+                            'BW변화': bw_status,
+                            'BW_Value': f"{bw_curr:.4f}",
                             'MACD-V': f"{curr['MACD_V']:.2f}", 'MACD_V_Value': f"{curr['MACD_V']:.2f}",
                             '비고': '일봉 볼밴상단 돌파'
                         })
@@ -519,12 +516,23 @@ with tab1:
                         sector = get_stock_sector(real_ticker)
                         window_52w = df.iloc[-52:]
                         curr_high_date = window_52w['Close'].idxmax().strftime('%Y-%m-%d')
-                        bw_str = f"{curr['BandWidth']:.4f}"
-                        if curr['BandWidth'] < 0.25: bw_str += " (low_vol)"
+                        
+                        # [NEW] BW 분석 (주봉 기준 20주 전)
+                        bw_curr = curr['BandWidth']
+                        bw_past = df['BandWidth'].iloc[-21] 
+                        bw_diff = bw_past - bw_curr
+                        bw_status = "감소" if bw_diff > 0 else "증가"
+
+                        bw_str = f"{bw_curr:.4f}"
+                        if bw_curr < 0.25: bw_str += " (low_vol)"
+                        
                         results.append({
                             '종목코드': real_ticker, '섹터': sector, '현재가': f"{curr['Close']:,.0f}",
-                            '현52주신고가일': curr_high_date, 'BW(20주)': bw_str,
-                            'BW_Value': f"{curr['BandWidth']:.4f}",
+                            '현52주신고가일': curr_high_date, 
+                            'BW현재': bw_str,
+                            'BW(20주전)': f"{bw_past:.4f}",
+                            'BW변화': bw_status,
+                            'BW_Value': f"{bw_curr:.4f}",
                             'MACD-V': f"{curr['MACD_V']:.2f}", 'MACD_V_Value': f"{curr['MACD_V']:.2f}",
                             '비고': '주봉 볼밴상단 돌파'
                         })

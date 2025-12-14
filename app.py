@@ -50,14 +50,18 @@ def get_tickers_from_sheet():
         return []
 
 def get_etfs_from_sheet():
+    """ETF 목록 읽어오기 (헤더 처리 강화)"""
     try:
         df = pd.read_csv(ETF_CSV_URL, header=None)
         etf_list = []
         for index, row in df.iterrows():
             ticker = str(row[0]).strip()
+            # 헤더(Ticker 등)나 빈 칸은 건너뛰기
+            if not ticker or ticker.lower() in ['ticker', 'symbol', '종목코드', '티커']:
+                continue
+                
             name = str(row[1]).strip() if len(row) > 1 else ticker
-            if ticker:
-                etf_list.append((ticker, name))
+            etf_list.append((ticker, name))
         return etf_list
     except Exception as e:
         st.error(f"ETF 시트 읽기 실패: {e}")
@@ -187,7 +191,6 @@ def calculate_macdv(df, short=12, long=26, signal=9):
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     atr = tr.ewm(span=long, adjust=False).mean()
     
-    # 분모 0 방지
     macd_v = (macd_line / (atr + 1e-9)) * 100
     macd_v_signal = macd_v.ewm(span=signal, adjust=False).mean()
     return macd_v, macd_v_signal
@@ -280,14 +283,15 @@ def calculate_daily_indicators(df):
 
     return df
 
-# [업데이트] 섹터 추세 분석 (요청사항 반영)
+# [수정] 상위 10개 제한 해제 및 누락 데이터 카운팅 추가
 def analyze_sector_trend():
     etfs = get_etfs_from_sheet()
     if not etfs:
         st.warning("ETF 목록을 불러오지 못했습니다.")
         return []
 
-    # SPY 다운로드 (벤치마크)
+    st.write(f"📊 총 {len(etfs)}개 ETF에 대해 분석을 시도합니다.")
+
     spy_ticker, spy_df = smart_download("SPY", interval="1d", period="2y")
     if len(spy_df) < 260:
         st.error("SPY 데이터 부족으로 분석 불가")
@@ -300,20 +304,24 @@ def analyze_sector_trend():
     spy_r12m = spy_close.pct_change(252).iloc[-1]
 
     results = []
+    skipped_count = 0
     progress_bar = st.progress(0)
     
     for i, (ticker, name) in enumerate(etfs):
         progress_bar.progress((i + 1) / len(etfs))
         real_ticker, df = smart_download(ticker, interval="1d", period="2y")
-        if len(df) < 260: continue
         
-        # --- 1. 지표 계산 ---
+        # 데이터가 1년(약 260일) 미만이면 분석 불가 -> 스킵 카운트
+        if len(df) < 260: 
+            skipped_count += 1
+            continue
+        
         close = df['Close']
         high = df['High']
         
         # EMAs
         ema20 = close.ewm(span=20, adjust=False).mean()
-        ema50 = close.ewm(span=50, adjust=False).mean() # BB용
+        ema50 = close.ewm(span=50, adjust=False).mean() 
         ema60 = close.ewm(span=60, adjust=False).mean()
         ema100 = close.ewm(span=100, adjust=False).mean()
         ema200 = close.ewm(span=200, adjust=False).mean()
@@ -338,26 +346,20 @@ def analyze_sector_trend():
         macdv, _ = calculate_macdv(df, 12, 26, 9)
         curr_macdv = macdv.iloc[-1]
 
-        # --- 2. 조건 확인 ---
-        
-        # A. BB(50, 2) 최근 3일 내 돌파 여부
+        # Conditions
         bb_check = (close > bb50_up).iloc[-3:]
         bb_breakout = "O" if bb_check.any() else "-"
         
-        # B. 돈키언(50) 최근 3일 내 돌파 여부
         dc_check = (close > donchian_50).iloc[-3:]
         dc_breakout = "O" if dc_check.any() else "-"
         
-        # C. 추세: 정배열 (Price > 20, 60, 100, 200)
         e20 = ema20.iloc[-1]; e60 = ema60.iloc[-1]; e100 = ema100.iloc[-1]; e200 = ema200.iloc[-1]
         is_aligned = (curr_price > e20) and (curr_price > e60) and (curr_price > e100) and (curr_price > e200)
         trend_align = "⭐ 정배열" if is_aligned else "-"
         
-        # D. 장기추세: 60 > 100 > 200
         is_long_trend = (e60 > e100) and (e100 > e200)
         long_trend_str = "📈 상승" if is_long_trend else "-"
         
-        # E. 모멘텀 점수 (RS)
         r1m = close.pct_change(21).iloc[-1]
         r3m = close.pct_change(63).iloc[-1]
         r6m = close.pct_change(126).iloc[-1]
@@ -385,13 +387,14 @@ def analyze_sector_trend():
     
     progress_bar.empty()
     
-    # 전체 리스트 반환 (상위 10개 제한 해제)
+    if skipped_count > 0:
+        st.warning(f"⚠️ 데이터 부족(상장 1년 미만 등)으로 {skipped_count}개 ETF가 분석에서 제외되었습니다.")
+
     df_res = pd.DataFrame(results)
     if not df_res.empty:
-        # 모멘텀 점수 높은 순으로 정렬
+        # 상위 10개 제한(.head(10))을 삭제함!
         df_res = df_res.sort_values(by="모멘텀점수", ascending=False)
         
-        # 포맷팅
         df_res['모멘텀점수'] = df_res['모멘텀점수'].apply(lambda x: f"{x:.2f}")
         df_res['현재가'] = df_res['현재가'].apply(lambda x: f"{x:,.2f}")
     
@@ -506,11 +509,6 @@ def check_inverse_hs_pattern(df):
 def check_pullback_pattern(df):
     if len(df) < 60: return False, None
     df = df.copy()
-    
-    df['EMA60'] = df['Close'].ewm(span=60, adjust=False).mean()
-    df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
-    df['VolSMA20'] = df['Volume'].rolling(window=20).mean()
-    
     curr = df.iloc[-1]
     
     if curr['Close'] < curr['EMA60']: return False, "추세 이탈"
@@ -544,7 +542,7 @@ with tab1:
         st.info("ETF 섹터 추세 및 RS 모멘텀을 분석합니다... (모든 ETF 조회)")
         df_sector = analyze_sector_trend()
         if not df_sector.empty:
-            st.success(f"✅ 총 {len(df_sector)}개 ETF 섹터 분석 결과")
+            st.success(f"✅ 총 {len(df_sector)}개 ETF 섹터 분석 결과 (모멘텀 순)")
             st.dataframe(df_sector, use_container_width=True)
         else:
             st.warning("분석할 데이터가 부족합니다.")

@@ -16,7 +16,7 @@ SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJ
 # 1. 페이지 설정 및 DB 연결
 # ==========================================
 st.set_page_config(page_title="Pro 주식 검색기", layout="wide")
-st.title("📈 Pro 주식 검색기: 5-Factor 복합 전략")
+st.title("📈 Pro 주식 검색기: 5-Factor & ATR 분석")
 
 @st.cache_resource
 def init_supabase():
@@ -121,17 +121,15 @@ def get_stock_sector(ticker):
         tick = yf.Ticker(ticker)
         info = tick.info
         
-        # 1순위: ETF 확인
         quote_type = info.get('quoteType', '').upper()
         if 'ETF' in quote_type or 'FUND' in quote_type:
             name = info.get('shortName', '')
             if not name: name = info.get('longName', 'ETF')
             return f"[ETF] {name}"
 
-        # 2순위: 섹터/산업
         sector = info.get('sector', '')
         if not sector: sector = info.get('industry', '')
-        if not sector: sector = info.get('shortName', '') # 3순위: 기업명
+        if not sector: sector = info.get('shortName', '')
         if not sector: return "Unknown"
 
         translations = {
@@ -193,66 +191,16 @@ def calculate_macdv(df, short=12, long=26, signal=9):
     macd_v_signal = macd_v.ewm(span=signal, adjust=False).mean()
     return macd_v, macd_v_signal
 
-# [수정된 함수] 일봉 지표 계산 (5가지 조건 + ATR)
-def calculate_daily_indicators(df):
-    if len(df) < 260: return None
-    df = df.copy()
-    
-    # 1. BB (50일 EMA, 2시그마) - 조건 1용
-    df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
-    df['STD50'] = df['Close'].rolling(window=50).std()
-    df['BB50_UP'] = df['EMA50'] + (2 * df['STD50'])
-    
-    # 2. Donchian Channel (50일) - 조건 2용
-    # 당일 포함 돌파 체크를 위해 shift(1) 사용 (어제까지의 50일 고점보다 오늘 종가가 높으면 돌파)
-    df['Donchian_High_50'] = df['High'].rolling(window=50).max().shift(1)
-    
-    # 3. VR (50일) - 조건 3용
-    df['Change'] = df['Close'].diff()
-    df['Vol_Up'] = np.where(df['Change'] > 0, df['Volume'], 0)
-    df['Vol_Down'] = np.where(df['Change'] < 0, df['Volume'], 0)
-    df['Vol_Flat'] = np.where(df['Change'] == 0, df['Volume'], 0)
-    roll_up = df['Vol_Up'].rolling(window=50).sum()
-    roll_down = df['Vol_Down'].rolling(window=50).sum()
-    roll_flat = df['Vol_Flat'].rolling(window=50).sum()
-    df['VR50'] = ((roll_up + roll_flat/2) / (roll_down + roll_flat/2 + 1e-9)) * 100
-    
-    # 4. BW (60일 EMA, 2시그마) - 조건 4용
-    df['EMA60'] = df['Close'].ewm(span=60, adjust=False).mean()
-    df['STD60'] = df['Close'].rolling(window=60).std()
-    df['BB60_UP'] = df['EMA60'] + (2 * df['STD60'])
-    df['BB60_LO'] = df['EMA60'] - (2 * df['STD60'])
-    df['BW60'] = (df['BB60_UP'] - df['BB60_LO']) / df['EMA60']
-    
-    # 5. MACD Custom (20, 200, 20) - 조건 5용
-    ema_fast = df['Close'].ewm(span=20, adjust=False).mean()
-    ema_slow = df['Close'].ewm(span=200, adjust=False).mean()
-    df['MACD_Line_C'] = ema_fast - ema_slow
-    df['MACD_Signal_C'] = df['MACD_Line_C'].ewm(span=20, adjust=False).mean()
-    df['MACD_OSC_C'] = df['MACD_Line_C'] - df['MACD_Signal_C']
-    
-    # 6. ATR (14일) - 표시용
-    high_low = df['High'] - df['Low']
-    high_close = np.abs(df['High'] - df['Close'].shift())
-    low_close = np.abs(df['Low'] - df['Close'].shift())
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df['ATR14'] = tr.ewm(span=14, adjust=False).mean()
-
-    # MACD-V (DB 저장용)
-    df['MACD_V'], _ = calculate_macdv(df, 12, 26, 9)
-
-    return df
-
-# 주봉 지표 계산 (기존 유지)
-def calculate_weekly_indicators(df):
-    if len(df) < 60: return None
+def calculate_common_indicators(df, is_weekly=False):
+    if len(df) < 100: return None
     df = df.copy()
 
-    df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
-    df['STD20'] = df['Close'].rolling(window=20).std()
-    df['BB_UP'] = df['EMA20'] + (2 * df['STD20'])
-    df['BB_LO'] = df['EMA20'] - (2 * df['STD20'])
-    df['BandWidth'] = (df['BB_UP'] - df['BB_LO']) / df['EMA20']
+    period = 20 if is_weekly else 60
+    df[f'EMA{period}'] = df['Close'].ewm(span=period, adjust=False).mean()
+    df[f'STD{period}'] = df['Close'].rolling(window=period).std()
+    df['BB_UP'] = df[f'EMA{period}'] + (2 * df[f'STD{period}'])
+    df['BB_LO'] = df[f'EMA{period}'] - (2 * df[f'STD{period}'])
+    df['BandWidth'] = (df['BB_UP'] - df['BB_LO']) / df[f'EMA{period}']
 
     df['MACD_V'], df['MACD_V_Signal'] = calculate_macdv(df, 12, 26, 9)
 
@@ -271,6 +219,66 @@ def calculate_weekly_indicators(df):
     roll_flat = df['Vol_Flat'].rolling(window=20).sum()
     df['VR20'] = ((roll_up + roll_flat/2) / (roll_down + roll_flat/2 + 1e-9)) * 100
     
+    # ATR (14일/14주)
+    high_low = df['High'] - df['Low']
+    high_close = np.abs(df['High'] - df['Close'].shift())
+    low_close = np.abs(df['Low'] - df['Close'].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['ATR14'] = tr.ewm(span=14, adjust=False).mean()
+
+    # Extra EMAs
+    df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+    df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
+    df['VolSMA20'] = df['Volume'].rolling(window=20).mean()
+
+    return df
+
+def calculate_daily_indicators(df):
+    if len(df) < 260: return None
+    df = df.copy()
+    
+    # 1. BB (50일 EMA, 2시그마)
+    df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
+    df['STD50'] = df['Close'].rolling(window=50).std()
+    df['BB50_UP'] = df['EMA50'] + (2 * df['STD50'])
+    
+    # 2. Donchian Channel (50일)
+    df['Donchian_High_50'] = df['High'].rolling(window=50).max().shift(1)
+    
+    # 3. VR (50일)
+    df['Change'] = df['Close'].diff()
+    df['Vol_Up'] = np.where(df['Change'] > 0, df['Volume'], 0)
+    df['Vol_Down'] = np.where(df['Change'] < 0, df['Volume'], 0)
+    df['Vol_Flat'] = np.where(df['Change'] == 0, df['Volume'], 0)
+    roll_up = df['Vol_Up'].rolling(window=50).sum()
+    roll_down = df['Vol_Down'].rolling(window=50).sum()
+    roll_flat = df['Vol_Flat'].rolling(window=50).sum()
+    df['VR50'] = ((roll_up + roll_flat/2) / (roll_down + roll_flat/2 + 1e-9)) * 100
+    
+    # 4. BW (60일 EMA, 2시그마)
+    df['EMA60'] = df['Close'].ewm(span=60, adjust=False).mean()
+    df['STD60'] = df['Close'].rolling(window=60).std()
+    df['BB60_UP'] = df['EMA60'] + (2 * df['STD60'])
+    df['BB60_LO'] = df['EMA60'] - (2 * df['STD60'])
+    df['BW60'] = (df['BB60_UP'] - df['BB60_LO']) / df['EMA60']
+    
+    # 5. MACD Custom (20, 200, 20)
+    ema_fast = df['Close'].ewm(span=20, adjust=False).mean()
+    ema_slow = df['Close'].ewm(span=200, adjust=False).mean()
+    df['MACD_Line_C'] = ema_fast - ema_slow
+    df['MACD_Signal_C'] = df['MACD_Line_C'].ewm(span=20, adjust=False).mean()
+    df['MACD_OSC_C'] = df['MACD_Line_C'] - df['MACD_Signal_C']
+    
+    # 6. ATR (14일)
+    high_low = df['High'] - df['Low']
+    high_close = np.abs(df['High'] - df['Close'].shift())
+    low_close = np.abs(df['Low'] - df['Close'].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['ATR14'] = tr.ewm(span=14, adjust=False).mean()
+
+    # MACD-V (DB용)
+    df['MACD_V'], _ = calculate_macdv(df, 12, 26, 9)
+
     return df
 
 def analyze_sector_trend():
@@ -312,12 +320,7 @@ def analyze_sector_trend():
         r6m = close.pct_change(126).iloc[-1]
         r12m = close.pct_change(252).iloc[-1]
         
-        rs_score = (
-            0.25 * (r1m - spy_r1m) +
-            0.25 * (r3m - spy_r3m) +
-            0.25 * (r6m - spy_r6m) +
-            0.25 * (r12m - spy_r12m)
-        ) * 100
+        rs_score = (0.25 * (r1m - spy_r1m) + 0.25 * (r3m - spy_r3m) + 0.25 * (r6m - spy_r6m) + 0.25 * (r12m - spy_r12m)) * 100
 
         results.append({
             "ETF": real_ticker, "ETF명": name, "모멘텀점수": rs_score, "추세": alignment_str, "현재가": curr_price
@@ -441,8 +444,6 @@ def check_pullback_pattern(df):
     if len(df) < 60: return False, None
     df = df.copy()
     
-    # 일봉 기준 EMA60, EMA20 등이 calculate_daily에서 계산되지 않았을 수 있으므로
-    # 이 함수 내에서 독립적으로 필요한 지표 계산 (안정성 확보)
     df['EMA60'] = df['Close'].ewm(span=60, adjust=False).mean()
     df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
     df['VolSMA20'] = df['Volume'].rolling(window=20).mean()
@@ -502,35 +503,38 @@ with tab1:
                     if df is None: continue
                     curr = df.iloc[-1]
                     
-                    # --- 5가지 스크리닝 조건 확인 ---
-                    # 1. BB 돌파 (50일, 2시그마)
-                    cond1 = curr['Close'] > curr['BB50_UP']
-                    # 2. 돈키언 채널 돌파 (50일 신고가)
-                    cond2 = curr['Close'] > curr['Donchian_High_50']
-                    # 3. VR(50) 급등 (최근 3일 내 > 125)
+                    # --- [수정된] 5가지 스크리닝 조건 ---
+                    # 1. BB 돌파 (최근 3일 내)
+                    # Close > BB50_UP
+                    bb_cond = df['Close'] > df['BB50_UP']
+                    cond1 = bb_cond.iloc[-3:].any()
+                    
+                    # 2. 돈키언 채널 돌파 (최근 3일 내)
+                    # Close > Donchian_High_50
+                    dc_cond = df['Close'] > df['Donchian_High_50']
+                    cond2 = dc_cond.iloc[-3:].any()
+                    
+                    # 3. VR 급등 (최근 3일 내 > 125)
                     vr_check = df['VR50'].iloc[-3:]
                     cond3 = (vr_check > 125).any()
+                    
                     # 4. BW 수축 (50일전 > 현재)
-                    # 데이터가 충분한지 확인 (50일 전 = -51 인덱스)
                     if len(df) > 55:
                         bw_past_50 = df['BW60'].iloc[-51]
                         cond4 = bw_past_50 > curr['BW60']
-                    else:
-                        cond4 = False
+                    else: cond4 = False
+                    
                     # 5. MACD OSC > 0
                     cond5 = curr['MACD_OSC_C'] > 0
                     
-                    # 모든 조건 충족 시
                     if cond1 and cond2 and cond3 and cond4 and cond5:
                         sector = get_stock_sector(real_ticker)
-                        # 52주 신고가
                         window_52w = df.iloc[-252:]
                         curr_high_date = window_52w['Close'].idxmax().strftime('%Y-%m-%d')
                         prev_win = window_52w[window_52w.index < window_52w['Close'].idxmax()]
                         prev_high_date = prev_win['Close'].idxmax().strftime('%Y-%m-%d') if len(prev_win)>0 else "-"
                         diff_days = (window_52w['Close'].idxmax() - prev_win['Close'].idxmax()).days if len(prev_win)>0 else 0
                         
-                        # BW 상태
                         bw_str = f"{curr['BW60']:.4f}"
                         if curr['BW60'] < 0.25: bw_str += " (low_vol)"
                         
@@ -547,9 +551,7 @@ with tab1:
                             'MACD-V': f"{curr['MACD_V']:.2f}", 
                             'MACD_V_Value': f"{curr['MACD_V']:.2f}"
                         })
-                except Exception as e:
-                    # print(e) # 디버깅용
-                    continue
+                except Exception as e: continue
             
             progress_bar.empty()
             if results:
@@ -558,7 +560,7 @@ with tab1:
                 save_to_supabase(results, "Daily_5Factor")
             else: st.warning("5가지 복합 조건을 모두 만족하는 종목이 없습니다.")
 
-    # [B] 주봉 분석 (기존 로직 유지)
+    # [B] 주봉 분석
     if cols[2].button("📅 주봉 분석"):
         tickers = get_tickers_from_sheet()
         if tickers:
@@ -591,6 +593,7 @@ with tab1:
                         
                         results.append({
                             '종목코드': real_ticker, '섹터': sector, '현재가': f"{curr['Close']:,.0f}",
+                            'ATR(14)': f"{curr['ATR14']:,.0f}", # ATR 추가
                             '현52주신고가일': curr_high_date, 
                             '전52주신고가일': prev_high_date,
                             '차이일': f"{diff_days}일",
@@ -694,8 +697,6 @@ with tab2:
                 if len(df) == 0: continue
                 try:
                     # 눌림목 분석용 지표 계산 (common indicator 사용)
-                    # check_pullback_pattern 함수는 독립적으로 계산하므로 그대로 사용 가능
-                    # 다만 MACD-V 조건 체크를 위해 calculate_common_indicators 사용
                     df = calculate_common_indicators(df, is_weekly=False)
                     if df is None: continue
                     curr = df.iloc[-1]

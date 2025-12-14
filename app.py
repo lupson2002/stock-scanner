@@ -16,7 +16,7 @@ SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJ
 # 1. 페이지 설정 및 DB 연결
 # ==========================================
 st.set_page_config(page_title="Pro 주식 검색기", layout="wide")
-st.title("📈 Pro 주식 검색기: 5-Factor & ATR 분석")
+st.title("📈 Pro 주식 검색기: 섹터 종합 분석 & 5-Factor")
 
 @st.cache_resource
 def init_supabase():
@@ -187,6 +187,7 @@ def calculate_macdv(df, short=12, long=26, signal=9):
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     atr = tr.ewm(span=long, adjust=False).mean()
     
+    # 분모 0 방지
     macd_v = (macd_line / (atr + 1e-9)) * 100
     macd_v_signal = macd_v.ewm(span=signal, adjust=False).mean()
     return macd_v, macd_v_signal
@@ -219,14 +220,12 @@ def calculate_common_indicators(df, is_weekly=False):
     roll_flat = df['Vol_Flat'].rolling(window=20).sum()
     df['VR20'] = ((roll_up + roll_flat/2) / (roll_down + roll_flat/2 + 1e-9)) * 100
     
-    # ATR (14일/14주)
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
     low_close = np.abs(df['Low'] - df['Close'].shift())
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR14'] = tr.ewm(span=14, adjust=False).mean()
 
-    # Extra EMAs
     df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
     df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
     df['VolSMA20'] = df['Volume'].rolling(window=20).mean()
@@ -281,12 +280,14 @@ def calculate_daily_indicators(df):
 
     return df
 
+# [업데이트] 섹터 추세 분석 (요청사항 반영)
 def analyze_sector_trend():
     etfs = get_etfs_from_sheet()
     if not etfs:
         st.warning("ETF 목록을 불러오지 못했습니다.")
         return []
 
+    # SPY 다운로드 (벤치마크)
     spy_ticker, spy_df = smart_download("SPY", interval="1d", period="2y")
     if len(spy_df) < 260:
         st.error("SPY 데이터 부족으로 분석 불가")
@@ -300,38 +301,100 @@ def analyze_sector_trend():
 
     results = []
     progress_bar = st.progress(0)
+    
     for i, (ticker, name) in enumerate(etfs):
         progress_bar.progress((i + 1) / len(etfs))
         real_ticker, df = smart_download(ticker, interval="1d", period="2y")
         if len(df) < 260: continue
         
+        # --- 1. 지표 계산 ---
         close = df['Close']
-        ema20 = close.ewm(span=20, adjust=False).mean().iloc[-1]
-        ema60 = close.ewm(span=60, adjust=False).mean().iloc[-1]
-        ema100 = close.ewm(span=100, adjust=False).mean().iloc[-1]
-        ema200 = close.ewm(span=200, adjust=False).mean().iloc[-1]
+        high = df['High']
+        
+        # EMAs
+        ema20 = close.ewm(span=20, adjust=False).mean()
+        ema50 = close.ewm(span=50, adjust=False).mean() # BB용
+        ema60 = close.ewm(span=60, adjust=False).mean()
+        ema100 = close.ewm(span=100, adjust=False).mean()
+        ema200 = close.ewm(span=200, adjust=False).mean()
+        
         curr_price = close.iloc[-1]
         
-        is_aligned = (curr_price > ema20) and (curr_price > ema60) and (curr_price > ema100) and (curr_price > ema200)
-        alignment_str = "⭐ 정배열" if is_aligned else "-"
+        # BB(50, 2)
+        std50 = close.rolling(window=50).std()
+        bb50_up = ema50 + (2 * std50)
         
+        # Donchian(50)
+        donchian_50 = high.rolling(window=50).max().shift(1)
+        
+        # ATR(14)
+        high_low = df['High'] - df['Low']
+        high_close = np.abs(df['High'] - df['Close'].shift())
+        low_close = np.abs(df['Low'] - df['Close'].shift())
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        atr14 = tr.ewm(span=14, adjust=False).mean().iloc[-1]
+        
+        # MACD-V
+        macdv, _ = calculate_macdv(df, 12, 26, 9)
+        curr_macdv = macdv.iloc[-1]
+
+        # --- 2. 조건 확인 ---
+        
+        # A. BB(50, 2) 최근 3일 내 돌파 여부
+        bb_check = (close > bb50_up).iloc[-3:]
+        bb_breakout = "O" if bb_check.any() else "-"
+        
+        # B. 돈키언(50) 최근 3일 내 돌파 여부
+        dc_check = (close > donchian_50).iloc[-3:]
+        dc_breakout = "O" if dc_check.any() else "-"
+        
+        # C. 추세: 정배열 (Price > 20, 60, 100, 200)
+        e20 = ema20.iloc[-1]; e60 = ema60.iloc[-1]; e100 = ema100.iloc[-1]; e200 = ema200.iloc[-1]
+        is_aligned = (curr_price > e20) and (curr_price > e60) and (curr_price > e100) and (curr_price > e200)
+        trend_align = "⭐ 정배열" if is_aligned else "-"
+        
+        # D. 장기추세: 60 > 100 > 200
+        is_long_trend = (e60 > e100) and (e100 > e200)
+        long_trend_str = "📈 상승" if is_long_trend else "-"
+        
+        # E. 모멘텀 점수 (RS)
         r1m = close.pct_change(21).iloc[-1]
         r3m = close.pct_change(63).iloc[-1]
         r6m = close.pct_change(126).iloc[-1]
         r12m = close.pct_change(252).iloc[-1]
         
-        rs_score = (0.25 * (r1m - spy_r1m) + 0.25 * (r3m - spy_r3m) + 0.25 * (r6m - spy_r6m) + 0.25 * (r12m - spy_r12m)) * 100
+        rs_score = (
+            0.25 * (r1m - spy_r1m) +
+            0.25 * (r3m - spy_r3m) +
+            0.25 * (r6m - spy_r6m) +
+            0.25 * (r12m - spy_r12m)
+        ) * 100
 
         results.append({
-            "ETF": real_ticker, "ETF명": name, "모멘텀점수": rs_score, "추세": alignment_str, "현재가": curr_price
+            "ETF": real_ticker,
+            "ETF명": name,
+            "모멘텀점수": rs_score,
+            "BB(50,2)돌파": bb_breakout,
+            "돈키언(50)돌파": dc_breakout,
+            "정배열": trend_align,
+            "장기추세(60>100>200)": long_trend_str,
+            "MACD-V": f"{curr_macdv:.2f}",
+            "ATR": f"{atr14:.2f}",
+            "현재가": curr_price
         })
     
     progress_bar.empty()
+    
+    # 전체 리스트 반환 (상위 10개 제한 해제)
     df_res = pd.DataFrame(results)
     if not df_res.empty:
-        df_res = df_res.sort_values(by="모멘텀점수", ascending=False).head(10)
+        # 모멘텀 점수 높은 순으로 정렬
+        df_res = df_res.sort_values(by="모멘텀점수", ascending=False)
+        
+        # 포맷팅
         df_res['모멘텀점수'] = df_res['모멘텀점수'].apply(lambda x: f"{x:.2f}")
         df_res['현재가'] = df_res['현재가'].apply(lambda x: f"{x:,.2f}")
+    
     return df_res
 
 def check_cup_handle_pattern(df):
@@ -478,10 +541,10 @@ with tab1:
     
     # [1] ETF 섹터 추세 확인
     if cols[0].button("🌍 추세 섹터 확인"):
-        st.info("ETF 섹터 추세 및 RS 모멘텀을 분석합니다...")
+        st.info("ETF 섹터 추세 및 RS 모멘텀을 분석합니다... (모든 ETF 조회)")
         df_sector = analyze_sector_trend()
         if not df_sector.empty:
-            st.success("✅ 상위 10개 주도 섹터")
+            st.success(f"✅ 총 {len(df_sector)}개 ETF 섹터 분석 결과")
             st.dataframe(df_sector, use_container_width=True)
         else:
             st.warning("분석할 데이터가 부족합니다.")
@@ -503,22 +566,20 @@ with tab1:
                     if df is None: continue
                     curr = df.iloc[-1]
                     
-                    # --- [수정된] 5가지 스크리닝 조건 ---
+                    # 5-Factor 스크리닝
                     # 1. BB 돌파 (최근 3일 내)
-                    # Close > BB50_UP
                     bb_cond = df['Close'] > df['BB50_UP']
                     cond1 = bb_cond.iloc[-3:].any()
                     
                     # 2. 돈키언 채널 돌파 (최근 3일 내)
-                    # Close > Donchian_High_50
                     dc_cond = df['Close'] > df['Donchian_High_50']
                     cond2 = dc_cond.iloc[-3:].any()
                     
-                    # 3. VR 급등 (최근 3일 내 > 125)
+                    # 3. VR 급등 (최근 3일 내)
                     vr_check = df['VR50'].iloc[-3:]
                     cond3 = (vr_check > 125).any()
                     
-                    # 4. BW 수축 (50일전 > 현재)
+                    # 4. BW 수축
                     if len(df) > 55:
                         bw_past_50 = df['BW60'].iloc[-51]
                         cond4 = bw_past_50 > curr['BW60']
@@ -542,7 +603,7 @@ with tab1:
                             '종목코드': real_ticker, 
                             '섹터': sector, 
                             '현재가': f"{curr['Close']:,.0f}",
-                            'ATR(14)': f"{curr['ATR14']:,.0f}", # ATR 추가
+                            'ATR(14)': f"{curr['ATR14']:,.0f}",
                             '현52주신고가일': curr_high_date, 
                             '전52주신고가일': prev_high_date,
                             '차이일': f"{diff_days}일",
@@ -593,7 +654,7 @@ with tab1:
                         
                         results.append({
                             '종목코드': real_ticker, '섹터': sector, '현재가': f"{curr['Close']:,.0f}",
-                            'ATR(14)': f"{curr['ATR14']:,.0f}", # ATR 추가
+                            'ATR(14)': f"{curr['ATR14']:,.0f}",
                             '현52주신고가일': curr_high_date, 
                             '전52주신고가일': prev_high_date,
                             '차이일': f"{diff_days}일",

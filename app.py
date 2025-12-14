@@ -50,16 +50,15 @@ def get_tickers_from_sheet():
         return []
 
 def get_etfs_from_sheet():
-    """ETF 목록 읽어오기 (헤더 처리 강화)"""
+    """ETF 목록 읽어오기"""
     try:
         df = pd.read_csv(ETF_CSV_URL, header=None)
         etf_list = []
         for index, row in df.iterrows():
             ticker = str(row[0]).strip()
-            # 헤더(Ticker 등)나 빈 칸은 건너뛰기
+            # 헤더나 빈 값 제외
             if not ticker or ticker.lower() in ['ticker', 'symbol', '종목코드', '티커']:
                 continue
-                
             name = str(row[1]).strip() if len(row) > 1 else ticker
             etf_list.append((ticker, name))
         return etf_list
@@ -191,6 +190,7 @@ def calculate_macdv(df, short=12, long=26, signal=9):
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     atr = tr.ewm(span=long, adjust=False).mean()
     
+    # 분모 0 방지
     macd_v = (macd_line / (atr + 1e-9)) * 100
     macd_v_signal = macd_v.ewm(span=signal, adjust=False).mean()
     return macd_v, macd_v_signal
@@ -283,7 +283,7 @@ def calculate_daily_indicators(df):
 
     return df
 
-# [수정] 상위 10개 제한 해제 및 누락 데이터 카운팅 추가
+# [수정] 데이터 제한 완화 및 ETF명 삭제
 def analyze_sector_trend():
     etfs = get_etfs_from_sheet()
     if not etfs:
@@ -292,6 +292,7 @@ def analyze_sector_trend():
 
     st.write(f"📊 총 {len(etfs)}개 ETF에 대해 분석을 시도합니다.")
 
+    # SPY는 비교 기준이므로 데이터가 충분해야 함 (260일)
     spy_ticker, spy_df = smart_download("SPY", interval="1d", period="2y")
     if len(spy_df) < 260:
         st.error("SPY 데이터 부족으로 분석 불가")
@@ -311,8 +312,8 @@ def analyze_sector_trend():
         progress_bar.progress((i + 1) / len(etfs))
         real_ticker, df = smart_download(ticker, interval="1d", period="2y")
         
-        # 데이터가 1년(약 260일) 미만이면 분석 불가 -> 스킵 카운트
-        if len(df) < 260: 
+        # [수정] 260일 -> 30일로 완화 (최소한의 MA, ATR 계산용)
+        if len(df) < 30: 
             skipped_count += 1
             continue
         
@@ -360,10 +361,11 @@ def analyze_sector_trend():
         is_long_trend = (e60 > e100) and (e100 > e200)
         long_trend_str = "📈 상승" if is_long_trend else "-"
         
-        r1m = close.pct_change(21).iloc[-1]
-        r3m = close.pct_change(63).iloc[-1]
-        r6m = close.pct_change(126).iloc[-1]
-        r12m = close.pct_change(252).iloc[-1]
+        # [수정] 기간별 수익률 계산 (데이터 없으면 0 처리)
+        r1m = close.pct_change(21).iloc[-1] if len(close) > 21 else 0
+        r3m = close.pct_change(63).iloc[-1] if len(close) > 63 else 0
+        r6m = close.pct_change(126).iloc[-1] if len(close) > 126 else 0
+        r12m = close.pct_change(252).iloc[-1] if len(close) > 252 else 0
         
         rs_score = (
             0.25 * (r1m - spy_r1m) +
@@ -374,7 +376,7 @@ def analyze_sector_trend():
 
         results.append({
             "ETF": real_ticker,
-            "ETF명": name,
+            # "ETF명": name,  <-- [수정] 삭제됨
             "모멘텀점수": rs_score,
             "BB(50,2)돌파": bb_breakout,
             "돈키언(50)돌파": dc_breakout,
@@ -388,13 +390,11 @@ def analyze_sector_trend():
     progress_bar.empty()
     
     if skipped_count > 0:
-        st.warning(f"⚠️ 데이터 부족(상장 1년 미만 등)으로 {skipped_count}개 ETF가 분석에서 제외되었습니다.")
+        st.warning(f"⚠️ 데이터 극소(30일 미만)로 {skipped_count}개 ETF 제외됨")
 
     df_res = pd.DataFrame(results)
     if not df_res.empty:
-        # 상위 10개 제한(.head(10))을 삭제함!
         df_res = df_res.sort_values(by="모멘텀점수", ascending=False)
-        
         df_res['모멘텀점수'] = df_res['모멘텀점수'].apply(lambda x: f"{x:.2f}")
         df_res['현재가'] = df_res['현재가'].apply(lambda x: f"{x:,.2f}")
     

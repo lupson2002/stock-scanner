@@ -575,7 +575,7 @@ with tab1:
                     
                     # 3. VR 급등 (최근 3일 내)
                     vr_check = df['VR50'].iloc[-3:]
-                    cond3 = (vr_check > 125).any()
+                    cond3 = (vr_check > 110).any()
                     
                     # 4. BW 수축
                     if len(df) > 55:

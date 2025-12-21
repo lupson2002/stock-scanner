@@ -5,6 +5,7 @@ import numpy as np
 from datetime import datetime
 from supabase import create_client, Client
 from scipy.signal import argrelextrema
+import time
 
 # =========================================================
 # [설정] Supabase 연결 정보
@@ -55,12 +56,17 @@ def get_etfs_from_sheet():
         df = pd.read_csv(ETF_CSV_URL, header=None)
         etf_list = []
         for index, row in df.iterrows():
-            ticker = str(row[0]).strip()
-            # 헤더나 빈 값 제외
-            if not ticker or ticker.lower() in ['ticker', 'symbol', '종목코드', '티커']:
+            raw_ticker = str(row[0]).strip()
+            if not raw_ticker or raw_ticker.lower() in ['ticker', 'symbol', '종목코드', '티커', 'nan']:
                 continue
+            # 거래소 코드 제거 (BATS:QUAL -> QUAL)
+            if ':' in raw_ticker:
+                ticker = raw_ticker.split(':')[-1].strip()
+            else:
+                ticker = raw_ticker
             name = str(row[1]).strip() if len(row) > 1 else ticker
-            etf_list.append((ticker, name))
+            if ticker:
+                etf_list.append((ticker, name))
         return etf_list
     except Exception as e:
         st.error(f"ETF 시트 읽기 실패: {e}")
@@ -103,6 +109,8 @@ def remove_duplicates_from_db():
         st.error(f"중복 제거 실패: {e}")
 
 def smart_download(ticker, interval="1d", period="2y"):
+    """데이터 다운로드 (거래소 코드 제거 및 재시도 로직 포함)"""
+    if ':' in ticker: ticker = ticker.split(':')[-1]
     ticker = ticker.replace('/', '-')
     candidates = [ticker]
     if ticker.isdigit() and len(ticker) == 6:
@@ -110,11 +118,13 @@ def smart_download(ticker, interval="1d", period="2y"):
     
     for t in candidates:
         try:
-            df = yf.download(t, period=period, interval=interval, progress=False, auto_adjust=False)
-            if len(df) > 0:
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-                return t, df
+            for _ in range(3):
+                df = yf.download(t, period=period, interval=interval, progress=False, auto_adjust=False)
+                if len(df) > 0:
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.get_level_values(0)
+                    return t, df
+                time.sleep(0.3)
         except:
             continue
     return ticker, pd.DataFrame()
@@ -123,18 +133,15 @@ def get_stock_sector(ticker):
     try:
         tick = yf.Ticker(ticker)
         info = tick.info
-        
         quote_type = info.get('quoteType', '').upper()
         if 'ETF' in quote_type or 'FUND' in quote_type:
             name = info.get('shortName', '')
             if not name: name = info.get('longName', 'ETF')
             return f"[ETF] {name}"
-
         sector = info.get('sector', '')
         if not sector: sector = info.get('industry', '')
         if not sector: sector = info.get('shortName', '')
         if not sector: return "Unknown"
-
         translations = {
             'Technology': '기술', 'Healthcare': '헬스케어', 'Financial Services': '금융',
             'Consumer Cyclical': '임의소비재', 'Industrials': '산업재', 'Basic Materials': '소재',
@@ -158,8 +165,8 @@ def save_to_supabase(data_list, strategy_name):
             "sector": str(item.get('섹터', '-')),
             "price": str(item['현재가']).replace(',', ''),
             "strategy": strategy_name,
-            "high_date": str(item.get('현52주신고가일', '')),
-            "bw": str(item.get('BW_Value', '')), 
+            "high_date": str(item.get('현52주신고가일', '')), # 월봉 분석 시 ATH 날짜가 들어감
+            "bw": str(item.get('BW_Value', '')), # 월봉 분석 시 고권역 월수 등 활용 가능
             "macd_v": str(item.get('MACD_V_Value', ''))
         })
     
@@ -190,7 +197,6 @@ def calculate_macdv(df, short=12, long=26, signal=9):
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     atr = tr.ewm(span=long, adjust=False).mean()
     
-    # 분모 0 방지
     macd_v = (macd_line / (atr + 1e-9)) * 100
     macd_v_signal = macd_v.ewm(span=signal, adjust=False).mean()
     return macd_v, macd_v_signal
@@ -239,15 +245,12 @@ def calculate_daily_indicators(df):
     if len(df) < 260: return None
     df = df.copy()
     
-    # 1. BB (50일 EMA, 2시그마)
     df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['STD50'] = df['Close'].rolling(window=50).std()
     df['BB50_UP'] = df['EMA50'] + (2 * df['STD50'])
     
-    # 2. Donchian Channel (50일)
     df['Donchian_High_50'] = df['High'].rolling(window=50).max().shift(1)
     
-    # 3. VR (50일)
     df['Change'] = df['Close'].diff()
     df['Vol_Up'] = np.where(df['Change'] > 0, df['Volume'], 0)
     df['Vol_Down'] = np.where(df['Change'] < 0, df['Volume'], 0)
@@ -257,33 +260,28 @@ def calculate_daily_indicators(df):
     roll_flat = df['Vol_Flat'].rolling(window=50).sum()
     df['VR50'] = ((roll_up + roll_flat/2) / (roll_down + roll_flat/2 + 1e-9)) * 100
     
-    # 4. BW (60일 EMA, 2시그마)
     df['EMA60'] = df['Close'].ewm(span=60, adjust=False).mean()
     df['STD60'] = df['Close'].rolling(window=60).std()
     df['BB60_UP'] = df['EMA60'] + (2 * df['STD60'])
     df['BB60_LO'] = df['EMA60'] - (2 * df['STD60'])
     df['BW60'] = (df['BB60_UP'] - df['BB60_LO']) / df['EMA60']
     
-    # 5. MACD Custom (20, 200, 20)
     ema_fast = df['Close'].ewm(span=20, adjust=False).mean()
     ema_slow = df['Close'].ewm(span=200, adjust=False).mean()
     df['MACD_Line_C'] = ema_fast - ema_slow
     df['MACD_Signal_C'] = df['MACD_Line_C'].ewm(span=20, adjust=False).mean()
     df['MACD_OSC_C'] = df['MACD_Line_C'] - df['MACD_Signal_C']
     
-    # 6. ATR (14일)
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
     low_close = np.abs(df['Low'] - df['Close'].shift())
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR14'] = tr.ewm(span=14, adjust=False).mean()
 
-    # MACD-V (DB용)
     df['MACD_V'], _ = calculate_macdv(df, 12, 26, 9)
 
     return df
 
-# [수정] 데이터 제한 완화 및 ETF명 삭제
 def analyze_sector_trend():
     etfs = get_etfs_from_sheet()
     if not etfs:
@@ -292,7 +290,6 @@ def analyze_sector_trend():
 
     st.write(f"📊 총 {len(etfs)}개 ETF에 대해 분석을 시도합니다.")
 
-    # SPY는 비교 기준이므로 데이터가 충분해야 함 (260일)
     spy_ticker, spy_df = smart_download("SPY", interval="1d", period="2y")
     if len(spy_df) < 260:
         st.error("SPY 데이터 부족으로 분석 불가")
@@ -312,7 +309,6 @@ def analyze_sector_trend():
         progress_bar.progress((i + 1) / len(etfs))
         real_ticker, df = smart_download(ticker, interval="1d", period="2y")
         
-        # [수정] 260일 -> 30일로 완화 (최소한의 MA, ATR 계산용)
         if len(df) < 30: 
             skipped_count += 1
             continue
@@ -320,7 +316,6 @@ def analyze_sector_trend():
         close = df['Close']
         high = df['High']
         
-        # EMAs
         ema20 = close.ewm(span=20, adjust=False).mean()
         ema50 = close.ewm(span=50, adjust=False).mean() 
         ema60 = close.ewm(span=60, adjust=False).mean()
@@ -328,29 +323,21 @@ def analyze_sector_trend():
         ema200 = close.ewm(span=200, adjust=False).mean()
         
         curr_price = close.iloc[-1]
-        
-        # BB(50, 2)
         std50 = close.rolling(window=50).std()
         bb50_up = ema50 + (2 * std50)
-        
-        # Donchian(50)
         donchian_50 = high.rolling(window=50).max().shift(1)
         
-        # ATR(14)
         high_low = df['High'] - df['Low']
         high_close = np.abs(df['High'] - df['Close'].shift())
         low_close = np.abs(df['Low'] - df['Close'].shift())
         tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
         atr14 = tr.ewm(span=14, adjust=False).mean().iloc[-1]
         
-        # MACD-V
         macdv, _ = calculate_macdv(df, 12, 26, 9)
         curr_macdv = macdv.iloc[-1]
 
-        # Conditions
         bb_check = (close > bb50_up).iloc[-3:]
         bb_breakout = "O" if bb_check.any() else "-"
-        
         dc_check = (close > donchian_50).iloc[-3:]
         dc_breakout = "O" if dc_check.any() else "-"
         
@@ -361,7 +348,6 @@ def analyze_sector_trend():
         is_long_trend = (e60 > e100) and (e100 > e200)
         long_trend_str = "📈 상승" if is_long_trend else "-"
         
-        # [수정] 기간별 수익률 계산 (데이터 없으면 0 처리)
         r1m = close.pct_change(21).iloc[-1] if len(close) > 21 else 0
         r3m = close.pct_change(63).iloc[-1] if len(close) > 63 else 0
         r6m = close.pct_change(126).iloc[-1] if len(close) > 126 else 0
@@ -376,7 +362,6 @@ def analyze_sector_trend():
 
         results.append({
             "ETF": real_ticker,
-            # "ETF명": name,  <-- [수정] 삭제됨
             "모멘텀점수": rs_score,
             "BB(50,2)돌파": bb_breakout,
             "돈키언(50)돌파": dc_breakout,
@@ -390,7 +375,7 @@ def analyze_sector_trend():
     progress_bar.empty()
     
     if skipped_count > 0:
-        st.warning(f"⚠️ 데이터 극소(30일 미만)로 {skipped_count}개 ETF 제외됨")
+        st.warning(f"⚠️ 데이터 극소(30일 미만) 또는 티커 오류로 {skipped_count}개 ETF 제외됨")
 
     df_res = pd.DataFrame(results)
     if not df_res.empty:
@@ -535,7 +520,7 @@ if not supabase: st.warning("⚠️ DB 연결 키 오류")
 tab1, tab2 = st.tabs(["📊 신규 종목 발굴", "📉 저장된 종목 눌림목 찾기"])
 
 with tab1:
-    cols = st.columns(5)
+    cols = st.columns(6)
     
     # [1] ETF 섹터 추세 확인
     if cols[0].button("🌍 추세 섹터 확인"):
@@ -547,7 +532,7 @@ with tab1:
         else:
             st.warning("분석할 데이터가 부족합니다.")
 
-    # [2] 일봉 분석 (업데이트된 5-Factor 로직)
+    # [2] 일봉 분석
     if cols[1].button("🚀 일봉 분석"):
         tickers = get_tickers_from_sheet()
         if tickers:
@@ -564,29 +549,18 @@ with tab1:
                     if df is None: continue
                     curr = df.iloc[-1]
                     
-                    # 5-Factor 스크리닝
-                    # 1. BB 돌파 (최근 3일 내)
-                    bb_cond = df['Close'] > df['BB50_UP']
-                    cond1 = bb_cond.iloc[-3:].any()
-                    
-                    # 2. 돈키언 채널 돌파 (최근 3일 내)
-                    dc_cond = df['Close'] > df['Donchian_High_50']
-                    cond2 = dc_cond.iloc[-3:].any()
-                    
-                    # 3. VR 급등 (최근 3일 내)
+                    # 5-Factor
+                    bb_cond = (df['Close'] > df['BB50_UP']).iloc[-3:].any()
+                    dc_cond = (df['Close'] > df['Donchian_High_50']).iloc[-3:].any()
                     vr_check = df['VR50'].iloc[-3:]
-                    cond3 = (vr_check > 110).any()
-                    
-                    # 4. BW 수축
+                    cond3 = (vr_check > 125).any()
                     if len(df) > 55:
                         bw_past_50 = df['BW60'].iloc[-51]
                         cond4 = bw_past_50 > curr['BW60']
                     else: cond4 = False
-                    
-                    # 5. MACD OSC > 0
                     cond5 = curr['MACD_OSC_C'] > 0
                     
-                    if cond1 and cond2 and cond3 and cond4 and cond5:
+                    if bb_cond and dc_cond and cond3 and cond4 and cond5:
                         sector = get_stock_sector(real_ticker)
                         window_52w = df.iloc[-252:]
                         curr_high_date = window_52w['Close'].idxmax().strftime('%Y-%m-%d')
@@ -598,28 +572,22 @@ with tab1:
                         if curr['BW60'] < 0.25: bw_str += " (low_vol)"
                         
                         results.append({
-                            '종목코드': real_ticker, 
-                            '섹터': sector, 
-                            '현재가': f"{curr['Close']:,.0f}",
+                            '종목코드': real_ticker, '섹터': sector, '현재가': f"{curr['Close']:,.0f}",
                             'ATR(14)': f"{curr['ATR14']:,.0f}",
-                            '현52주신고가일': curr_high_date, 
-                            '전52주신고가일': prev_high_date,
-                            '차이일': f"{diff_days}일",
-                            'BW현재': bw_str,
-                            'BW_Value': f"{curr['BW60']:.4f}",
-                            'MACD-V': f"{curr['MACD_V']:.2f}", 
+                            '현52주신고가일': curr_high_date, '전52주신고가일': prev_high_date,
+                            '차이일': f"{diff_days}일", 'BW현재': bw_str,
+                            'BW_Value': f"{curr['BW60']:.4f}", 'MACD-V': f"{curr['MACD_V']:.2f}", 
                             'MACD_V_Value': f"{curr['MACD_V']:.2f}"
                         })
                 except Exception as e: continue
-            
             progress_bar.empty()
             if results:
                 st.success(f"[일봉 5-Factor] {len(results)}개 발견!")
                 st.dataframe(pd.DataFrame(results).drop(columns=['BW_Value', 'MACD_V_Value']))
                 save_to_supabase(results, "Daily_5Factor")
-            else: st.warning("5가지 복합 조건을 모두 만족하는 종목이 없습니다.")
+            else: st.warning("조건 만족 종목 없음")
 
-    # [B] 주봉 분석
+    # [3] 주봉 분석
     if cols[2].button("📅 주봉 분석"):
         tickers = get_tickers_from_sheet()
         if tickers:
@@ -652,15 +620,10 @@ with tab1:
                         
                         results.append({
                             '종목코드': real_ticker, '섹터': sector, '현재가': f"{curr['Close']:,.0f}",
-                            'ATR(14)': f"{curr['ATR14']:,.0f}",
-                            '현52주신고가일': curr_high_date, 
-                            '전52주신고가일': prev_high_date,
-                            '차이일': f"{diff_days}일",
-                            'BW현재': bw_str,
-                            'BW(20주전)': f"{bw_past:.4f}",
-                            'BW변화': bw_status,
-                            'BW_Value': f"{bw_curr:.4f}",
-                            'MACD-V': f"{curr['MACD_V']:.2f}", 
+                            'ATR(14)': f"{curr['ATR14']:,.0f}", '현52주신고가일': curr_high_date, 
+                            '전52주신고가일': prev_high_date, '차이일': f"{diff_days}일",
+                            'BW현재': bw_str, 'BW(20주전)': f"{bw_past:.4f}", 'BW변화': bw_status,
+                            'BW_Value': f"{bw_curr:.4f}", 'MACD-V': f"{curr['MACD_V']:.2f}", 
                             'MACD_V_Value': f"{curr['MACD_V']:.2f}"
                         })
                 except: continue
@@ -671,8 +634,67 @@ with tab1:
                 save_to_supabase(results, "Weekly")
             else: st.warning("조건 만족 없음")
 
-    # [C] 컵위드핸들
-    if cols[3].button("🏆 컵핸들"):
+    # [4] 월봉 분석 (NEW)
+    if cols[3].button("🗓️ 월봉 분석"):
+        tickers = get_tickers_from_sheet()
+        if tickers:
+            st.info(f"[월봉 ATH] {len(tickers)}개 분석 시작...")
+            progress_bar = st.progress(0)
+            results = []
+            for i, raw_ticker in enumerate(tickers):
+                progress_bar.progress((i + 1) / len(tickers))
+                if not raw_ticker: continue
+                
+                # 월봉 & 전체 기간
+                real_ticker, df = smart_download(raw_ticker, interval="1mo", period="max")
+                if len(df) < 12: continue # 최소 1년치 데이터 필요
+                
+                try:
+                    # 1. ATH 계산 (High 기준)
+                    ath_price = df['High'].max()
+                    ath_idx = df['High'].idxmax()
+                    ath_date_str = ath_idx.strftime('%Y-%m')
+                    
+                    # 2. 현재가 확인
+                    curr = df.iloc[-1]
+                    curr_price = curr['Close']
+                    threshold = ath_price * 0.85 # -15% 이내 (즉 85% 이상)
+                    
+                    if curr_price >= threshold:
+                        sector = get_stock_sector(real_ticker)
+                        
+                        # 3. 고권역(-15% 이내) 월 수 카운팅
+                        # 종가 기준으로 ATH의 85% 이상인 달의 개수
+                        count_mask = df['Close'] >= threshold
+                        month_count = count_mask.sum()
+                        
+                        results.append({
+                            '종목코드': real_ticker,
+                            '섹터': sector,
+                            '현재가': f"{curr_price:,.0f}",
+                            'ATH최고가': f"{ath_price:,.0f}",
+                            'ATH달성월': ath_date_str,
+                            '고권역(월수)': f"{month_count}개월",
+                            # DB 저장을 위한 매핑 (BW컬럼에 월수 저장)
+                            '현52주신고가일': ath_date_str, # DB high_date에 ATH 날짜 저장
+                            'BW_Value': str(month_count), # DB bw에 월수 저장
+                            'MACD_V_Value': "0" # 사용 안 함
+                        })
+                        
+                except Exception as e: continue
+            
+            progress_bar.empty()
+            if results:
+                st.success(f"[월봉 ATH] {len(results)}개 발견!")
+                # 화면 표시용 DF (DB용 컬럼 제외)
+                disp_df = pd.DataFrame(results).drop(columns=['현52주신고가일', 'BW_Value', 'MACD_V_Value'], errors='ignore')
+                st.dataframe(disp_df, use_container_width=True)
+                save_to_supabase(results, "Monthly_ATH")
+            else:
+                st.warning("ATH 대비 -15% 이내에 있는 종목이 없습니다.")
+
+    # [5] 컵위드핸들
+    if cols[4].button("🏆 컵핸들"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info(f"[컵핸들] {len(tickers)}개 분석 시작...")
@@ -706,8 +728,8 @@ with tab1:
                 save_to_supabase(results, "CupHandle")
             else: st.warning("조건 만족 없음")
 
-    # [D] 역헤드앤숄더
-    if cols[4].button("👤 역H&S"):
+    # [6] 역헤드앤숄더
+    if cols[5].button("👤 역H&S"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info(f"[역H&S] {len(tickers)}개 분석 시작...")
@@ -755,7 +777,6 @@ with tab2:
                 real_ticker, df = smart_download(raw_ticker, interval="1d")
                 if len(df) == 0: continue
                 try:
-                    # 눌림목 분석용 지표 계산 (common indicator 사용)
                     df = calculate_common_indicators(df, is_weekly=False)
                     if df is None: continue
                     curr = df.iloc[-1]

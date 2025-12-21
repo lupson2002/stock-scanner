@@ -165,8 +165,8 @@ def save_to_supabase(data_list, strategy_name):
             "sector": str(item.get('섹터', '-')),
             "price": str(item['현재가']).replace(',', ''),
             "strategy": strategy_name,
-            "high_date": str(item.get('현52주신고가일', '')), # 월봉 분석 시 ATH 날짜가 들어감
-            "bw": str(item.get('BW_Value', '')), # 월봉 분석 시 고권역 월수 등 활용 가능
+            "high_date": str(item.get('현52주신고가일', '')),
+            "bw": str(item.get('BW_Value', '')), 
             "macd_v": str(item.get('MACD_V_Value', ''))
         })
     
@@ -245,12 +245,15 @@ def calculate_daily_indicators(df):
     if len(df) < 260: return None
     df = df.copy()
     
+    # 1. BB (50일 EMA, 2시그마)
     df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['STD50'] = df['Close'].rolling(window=50).std()
     df['BB50_UP'] = df['EMA50'] + (2 * df['STD50'])
     
+    # 2. Donchian Channel (50일)
     df['Donchian_High_50'] = df['High'].rolling(window=50).max().shift(1)
     
+    # 3. VR (50일)
     df['Change'] = df['Close'].diff()
     df['Vol_Up'] = np.where(df['Change'] > 0, df['Volume'], 0)
     df['Vol_Down'] = np.where(df['Change'] < 0, df['Volume'], 0)
@@ -260,30 +263,35 @@ def calculate_daily_indicators(df):
     roll_flat = df['Vol_Flat'].rolling(window=50).sum()
     df['VR50'] = ((roll_up + roll_flat/2) / (roll_down + roll_flat/2 + 1e-9)) * 100
     
+    # 4. BW (60일 EMA, 2시그마)
     df['EMA60'] = df['Close'].ewm(span=60, adjust=False).mean()
     df['STD60'] = df['Close'].rolling(window=60).std()
     df['BB60_UP'] = df['EMA60'] + (2 * df['STD60'])
     df['BB60_LO'] = df['EMA60'] - (2 * df['STD60'])
     df['BW60'] = (df['BB60_UP'] - df['BB60_LO']) / df['EMA60']
     
+    # 5. MACD Custom (20, 200, 20)
     ema_fast = df['Close'].ewm(span=20, adjust=False).mean()
     ema_slow = df['Close'].ewm(span=200, adjust=False).mean()
     df['MACD_Line_C'] = ema_fast - ema_slow
     df['MACD_Signal_C'] = df['MACD_Line_C'].ewm(span=20, adjust=False).mean()
     df['MACD_OSC_C'] = df['MACD_Line_C'] - df['MACD_Signal_C']
     
+    # 6. ATR (14일)
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
     low_close = np.abs(df['Low'] - df['Close'].shift())
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR14'] = tr.ewm(span=14, adjust=False).mean()
 
+    # MACD-V (DB용)
     df['MACD_V'], _ = calculate_macdv(df, 12, 26, 9)
 
     return df
 
 def analyze_sector_trend():
     etfs = get_etfs_from_sheet()
+    
     if not etfs:
         st.warning("ETF 목록을 불러오지 못했습니다.")
         return []
@@ -307,6 +315,7 @@ def analyze_sector_trend():
     
     for i, (ticker, name) in enumerate(etfs):
         progress_bar.progress((i + 1) / len(etfs))
+        
         real_ticker, df = smart_download(ticker, interval="1d", period="2y")
         
         if len(df) < 30: 
@@ -323,8 +332,10 @@ def analyze_sector_trend():
         ema200 = close.ewm(span=200, adjust=False).mean()
         
         curr_price = close.iloc[-1]
+        
         std50 = close.rolling(window=50).std()
         bb50_up = ema50 + (2 * std50)
+        
         donchian_50 = high.rolling(window=50).max().shift(1)
         
         high_low = df['High'] - df['Low']
@@ -338,6 +349,7 @@ def analyze_sector_trend():
 
         bb_check = (close > bb50_up).iloc[-3:]
         bb_breakout = "O" if bb_check.any() else "-"
+        
         dc_check = (close > donchian_50).iloc[-3:]
         dc_breakout = "O" if dc_check.any() else "-"
         
@@ -655,16 +667,16 @@ with tab1:
                     ath_idx = df['High'].idxmax()
                     ath_date_str = ath_idx.strftime('%Y-%m')
                     
-                    # 2. 현재가 확인
+                    # 2. 현재가 확인 (90% 이상)
                     curr = df.iloc[-1]
                     curr_price = curr['Close']
-                    threshold = ath_price * 0.85 # -15% 이내 (즉 85% 이상)
+                    threshold = ath_price * 0.90 # -10% 이내 (즉 90% 이상)
                     
                     if curr_price >= threshold:
                         sector = get_stock_sector(real_ticker)
                         
-                        # 3. 고권역(-15% 이내) 월 수 카운팅
-                        # 종가 기준으로 ATH의 85% 이상인 달의 개수
+                        # 3. 고권역(-10% 이내) 월 수 카운팅
+                        # 종가 기준으로 ATH의 90% 이상인 달의 개수
                         count_mask = df['Close'] >= threshold
                         month_count = count_mask.sum()
                         
@@ -691,7 +703,7 @@ with tab1:
                 st.dataframe(disp_df, use_container_width=True)
                 save_to_supabase(results, "Monthly_ATH")
             else:
-                st.warning("ATH 대비 -15% 이내에 있는 종목이 없습니다.")
+                st.warning("ATH 대비 -10% 이내에 있는 종목이 없습니다.")
 
     # [5] 컵위드핸들
     if cols[4].button("🏆 컵핸들"):
@@ -777,6 +789,7 @@ with tab2:
                 real_ticker, df = smart_download(raw_ticker, interval="1d")
                 if len(df) == 0: continue
                 try:
+                    # 눌림목 분석용 지표 계산 (common indicator 사용)
                     df = calculate_common_indicators(df, is_weekly=False)
                     if df is None: continue
                     curr = df.iloc[-1]

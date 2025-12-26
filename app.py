@@ -924,15 +924,16 @@ with tab3:
             else: st.warning("데이터를 가져오지 못했습니다.")
 
 # ==============================================================================
-# [NEW] 4. 엑셀 데이터 매칭 탭 (DB 저장 & 초기화)
+# [NEW] 4. 엑셀 데이터 매칭 탭 (DB 저장 & 초기화 & 화이트리스트 적용)
 # ==============================================================================
 with tab4:
     st.markdown("### 📂 엑셀 데이터 매칭 (퀀티와이즈 DB 연동)")
     st.info("퀀티와이즈 엑셀(quant_master.xlsx)을 업로드하여 Supabase DB에 저장합니다.\n\n"
-            "**[개선된 규칙]**\n"
-            "- 참여증권사(G열) 무시, 티커/변화율만 추출\n"
-            "- 미국 주식: 점(.)을 하이픈(-)으로 변환하여 **본주(COF)**와 **우선주(COF-PRK)** 충돌 방지\n"
-            "- 한국 주식: DB에는 숫자만 저장, 앱 검색 시 접미사(.KS) 제거 후 매칭")
+            "**[화이트리스트 적용]**\n"
+            "- 구글 시트(TGT)에 있는 종목만 필터링하여 저장합니다. (나머지는 버림)\n"
+            "**[규칙]**\n"
+            "- 미국 주식: 점(.) -> 하이픈(-), 접미사(-US) 제거\n"
+            "- 한국 주식: 숫자만 저장 (접미사 -KS 제거)")
     
     col_upload, col_reset = st.columns([3, 1])
     
@@ -952,8 +953,8 @@ with tab4:
             except Exception as e:
                 st.error(f"초기화 실패 (Supabase 권한 확인 필요): {e}")
 
-    # --- 서브 함수: 엑셀 시트 파싱 ---
-    def parse_sheet_ticker_value(sheet_df):
+    # --- 서브 함수: 엑셀 시트 파싱 (화이트리스트 필터링 추가) ---
+    def parse_sheet_ticker_value(sheet_df, allowed_tickers):
         extracted = {}
         for index, row in sheet_df.iterrows():
             try:
@@ -961,9 +962,14 @@ with tab4:
                 if not raw_ticker or raw_ticker.lower() in ['code', 'ticker', 'nan', 'item type', 'comparison date']:
                     continue
                 
-                # [핵심] 정규화 (COF.PRK-US -> COF-PRK)
+                # 1. 정규화 (Quant -> DB Format)
                 norm_ticker = normalize_ticker_for_db_storage(raw_ticker)
                 
+                # 2. [핵심] 화이트리스트 필터링
+                # 구글 시트에 있는 종목인지 확인 (없으면 저장 안함)
+                if norm_ticker not in allowed_tickers:
+                    continue
+
                 val = row[3] # D열
                 if pd.isna(val) or str(val).strip() == '':
                     final_val = 0.0
@@ -980,6 +986,31 @@ with tab4:
 
     if uploaded_file and st.button("🔄 DB 업로드 및 분석 시작"):
         try:
+            # 0. 구글 시트에서 관리 종목(Target) 가져오기
+            st.info("구글 시트에서 관리 종목(TGT) 목록을 불러오는 중...")
+            tgt_stocks = get_tickers_from_sheet()
+            tgt_etfs = [x[0] for x in get_etfs_from_sheet()]
+            tgt_countries = [x[0] for x in get_country_etfs_from_sheet()]
+            
+            # 관리 종목 합치기 및 정규화 (DB 포맷과 일치시키기 위해)
+            raw_targets = set(tgt_stocks + tgt_etfs + tgt_countries)
+            allowed_db_tickers = set()
+            for t in raw_targets:
+                # 구글 시트에 있는 티커(예: 005930.KS, AAPL)를 DB 저장 포맷(005930, AAPL)으로 변환
+                # 정규화 함수 재사용 (입력이 이미 깔끔해도 안전함)
+                # 단, 구글시트의 .KS 등을 떼기 위해 normalize_ticker_for_app_lookup과 유사한 로직 필요
+                # 여기서는 normalize_ticker_for_db_storage가 가장 적합 (범용적)
+                # 구글시트: 005930 -> 005930
+                # 구글시트: AAPL -> AAPL
+                # 구글시트: 005930.KS -> 005930 (별도 처리가 필요할 수 있음)
+                
+                # 안전하게 .KS, .KQ 제거 로직 추가
+                t_clean = t.split('.')[0] # 005930.KS -> 005930, AAPL -> AAPL
+                t_clean = t_clean.split('-')[0] # 혹시 모를 하이픈 제거
+                allowed_db_tickers.add(t_clean)
+            
+            st.success(f"관리 대상 종목 {len(allowed_db_tickers)}개를 확인했습니다. 필터링을 시작합니다.")
+
             # 1. 엑셀 파일 읽기
             xls = pd.read_excel(uploaded_file, sheet_name=None, header=None)
             
@@ -993,65 +1024,68 @@ with tab4:
             if not (sheet_map['1w'] is not None and sheet_map['1m'] is not None and sheet_map['3m'] is not None):
                 st.error("엑셀 파일에 1w, 1m, 3m 시트가 모두 있어야 합니다.")
             else:
-                # 2. 파싱 (개선된 로직 적용)
-                data_1w = parse_sheet_ticker_value(sheet_map['1w'])
-                data_1m = parse_sheet_ticker_value(sheet_map['1m'])
-                data_3m = parse_sheet_ticker_value(sheet_map['3m'])
+                # 2. 파싱 (화이트리스트 전달)
+                data_1w = parse_sheet_ticker_value(sheet_map['1w'], allowed_db_tickers)
+                data_1m = parse_sheet_ticker_value(sheet_map['1m'], allowed_db_tickers)
+                data_3m = parse_sheet_ticker_value(sheet_map['3m'], allowed_db_tickers)
                 
                 # 3. 통합
                 all_tickers = set(data_1w.keys()) | set(data_1m.keys()) | set(data_3m.keys())
                 
-                # 4. DB 중복 체크 (오늘 날짜)
-                today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-                existing_map = {}
-                try:
-                    res = supabase.table("quant_data")\
-                        .select("*")\
-                        .gte("created_at", f"{today_str} 00:00:00")\
-                        .lte("created_at", f"{today_str} 23:59:59")\
-                        .execute()
-                    if res.data:
-                        for rec in res.data:
-                            existing_map[rec['ticker']] = (
-                                float(rec.get('change_1w', 0) or 0),
-                                float(rec.get('change_1m', 0) or 0),
-                                float(rec.get('change_3m', 0) or 0)
-                            )
-                except:
-                    pass
-                
-                rows_to_insert = []
-                skipped_count = 0
-                
-                for t in all_tickers:
-                    v_1w = data_1w.get(t, 0.0)
-                    v_1m = data_1m.get(t, 0.0)
-                    v_3m = data_3m.get(t, 0.0)
-                    
-                    if t in existing_map:
-                        e_1w, e_1m, e_3m = existing_map[t]
-                        if (e_1w == v_1w) and (e_1m == v_1m) and (e_3m == v_3m):
-                            skipped_count += 1
-                            continue
-                    
-                    rows_to_insert.append({
-                        "ticker": t,
-                        "change_1w": v_1w,
-                        "change_1m": v_1m,
-                        "change_3m": v_3m
-                    })
-                
-                if rows_to_insert:
-                    chunk_size = 100
-                    for i in range(0, len(rows_to_insert), chunk_size):
-                        chunk = rows_to_insert[i:i+chunk_size]
-                        supabase.table("quant_data").insert(chunk).execute()
-                    
-                    st.success(f"✅ DB 업로드 완료! (신규: {len(rows_to_insert)}건, 중복생략: {skipped_count}건)")
-                    fetch_latest_quant_data_from_db.clear()
-                    GLOBAL_QUANT_DATA = fetch_latest_quant_data_from_db()
+                if not all_tickers:
+                    st.warning("엑셀 파일에서 관리 종목(TGT)과 일치하는 데이터를 찾지 못했습니다.")
                 else:
-                    st.info(f"변동 사항이 없습니다. (중복 생략: {skipped_count}건)")
+                    # 4. DB 중복 체크
+                    today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+                    existing_map = {}
+                    try:
+                        res = supabase.table("quant_data")\
+                            .select("*")\
+                            .gte("created_at", f"{today_str} 00:00:00")\
+                            .lte("created_at", f"{today_str} 23:59:59")\
+                            .execute()
+                        if res.data:
+                            for rec in res.data:
+                                existing_map[rec['ticker']] = (
+                                    float(rec.get('change_1w', 0) or 0),
+                                    float(rec.get('change_1m', 0) or 0),
+                                    float(rec.get('change_3m', 0) or 0)
+                                )
+                    except:
+                        pass
+                    
+                    rows_to_insert = []
+                    skipped_count = 0
+                    
+                    for t in all_tickers:
+                        v_1w = data_1w.get(t, 0.0)
+                        v_1m = data_1m.get(t, 0.0)
+                        v_3m = data_3m.get(t, 0.0)
+                        
+                        if t in existing_map:
+                            e_1w, e_1m, e_3m = existing_map[t]
+                            if (e_1w == v_1w) and (e_1m == v_1m) and (e_3m == v_3m):
+                                skipped_count += 1
+                                continue
+                        
+                        rows_to_insert.append({
+                            "ticker": t,
+                            "change_1w": v_1w,
+                            "change_1m": v_1m,
+                            "change_3m": v_3m
+                        })
+                    
+                    if rows_to_insert:
+                        chunk_size = 100
+                        for i in range(0, len(rows_to_insert), chunk_size):
+                            chunk = rows_to_insert[i:i+chunk_size]
+                            supabase.table("quant_data").insert(chunk).execute()
+                        
+                        st.success(f"✅ DB 업로드 완료! (TGT 필터링 적용됨. 신규: {len(rows_to_insert)}건, 중복생략: {skipped_count}건)")
+                        fetch_latest_quant_data_from_db.clear()
+                        GLOBAL_QUANT_DATA = fetch_latest_quant_data_from_db()
+                    else:
+                        st.info(f"변동 사항이 없습니다. (중복 생략: {skipped_count}건)")
                 
         except Exception as e:
             st.error(f"작업 실패: {e}")

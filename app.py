@@ -7,6 +7,12 @@ from supabase import create_client, Client
 from scipy.signal import argrelextrema
 import time
 
+# [NEW] 재무분석용 라이브러리
+try:
+    from yahoo_fin import stock_info as si
+except ImportError:
+    st.error("yahoo_fin 라이브러리가 설치되지 않았습니다. (pip install yahoo_fin requests_html)")
+
 # =========================================================
 # [설정] Supabase 연결 정보
 # =========================================================
@@ -17,7 +23,7 @@ SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJ
 # 1. 페이지 설정 및 DB 연결
 # ==========================================
 st.set_page_config(page_title="Pro 주식 검색기", layout="wide")
-st.title("📈 Pro 주식 검색기: 다중 타임프레임 & 5-Factor")
+st.title("📈 Pro 주식 검색기: 섹터/기술적/재무 통합 분석")
 
 @st.cache_resource
 def init_supabase():
@@ -237,6 +243,8 @@ def calculate_daily_indicators(df):
     df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['STD50'] = df['Close'].rolling(window=50).std()
     df['BB50_UP'] = df['EMA50'] + (2 * df['STD50'])
+    df['BB50_LO'] = df['EMA50'] - (2 * df['STD50'])
+    df['BW50'] = (df['BB50_UP'] - df['BB50_LO']) / df['EMA50']
     
     # 2. Donchian Channel (50일)
     df['Donchian_High_50'] = df['High'].rolling(window=50).max().shift(1)
@@ -250,13 +258,6 @@ def calculate_daily_indicators(df):
     roll_down = df['Vol_Down'].rolling(window=50).sum()
     roll_flat = df['Vol_Flat'].rolling(window=50).sum()
     df['VR50'] = ((roll_up + roll_flat/2) / (roll_down + roll_flat/2 + 1e-9)) * 100
-    
-    # 4. BW (60일 EMA, 2시그마)
-    df['EMA60'] = df['Close'].ewm(span=60, adjust=False).mean()
-    df['STD60'] = df['Close'].rolling(window=60).std()
-    df['BB60_UP'] = df['EMA60'] + (2 * df['STD60'])
-    df['BB60_LO'] = df['EMA60'] - (2 * df['STD60'])
-    df['BW60'] = (df['BB60_UP'] - df['BB60_LO']) / df['EMA60']
     
     # 5. MACD Custom (20, 200, 20)
     ema_fast = df['Close'].ewm(span=20, adjust=False).mean()
@@ -272,35 +273,28 @@ def calculate_daily_indicators(df):
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR14'] = tr.ewm(span=14, adjust=False).mean()
 
-    # MACD-V (DB용)
     df['MACD_V'], _ = calculate_macdv(df, 12, 26, 9)
 
     return df
 
-# --- 분석 헬퍼 함수 (모듈화) ---
+# --- 분석 헬퍼 함수 ---
 def check_daily_condition(df):
-    """일봉 5-Factor + 스퀴즈 체크"""
     if len(df) < 260: return False, None
     df = calculate_daily_indicators(df)
     if df is None: return False, None
     curr = df.iloc[-1]
     
-    # 1. 필수: 돈키언 돌파 OR BB 돌파 (최근 3일 내)
     dc_cond = (df['Close'] > df['Donchian_High_50']).iloc[-3:].any()
     bb_cond = (df['Close'] > df['BB50_UP']).iloc[-3:].any()
     mandatory = dc_cond or bb_cond
     
-    # 2. 선택 (3개 중 2개 이상)
     vr_cond = (df['VR50'].iloc[-3:] > 110).any()
-    bw_cond = (df['BW60'].iloc[-51] > curr['BW60']) if len(df)>55 else False
+    bw_cond = (df['BW50'].iloc[-51] > curr['BW50']) if len(df)>55 else False
     macd_cond = curr['MACD_OSC_C'] > 0
     optional_count = sum([vr_cond, bw_cond, macd_cond])
     
     if mandatory and (optional_count >= 2):
-        # 스퀴즈 체크: 최근 5일 내 BB상단 < 돈키언상단
         squeeze = (df['BB50_UP'] < df['Donchian_High_50']).iloc[-5:].any()
-        
-        # 정보 리턴
         win_52 = df.iloc[-252:]
         high_52_date = win_52['Close'].idxmax().strftime('%Y-%m-%d')
         prev_win = win_52[win_52.index < win_52['Close'].idxmax()]
@@ -308,57 +302,41 @@ def check_daily_condition(df):
         diff_days = (win_52['Close'].idxmax() - prev_win['Close'].idxmax()).days if len(prev_win)>0 else 0
         
         return True, {
-            'price': curr['Close'],
-            'atr': curr['ATR14'],
-            'high_date': high_52_date,
-            'prev_date': prev_date,
-            'diff_days': diff_days,
-            'bw_curr': curr['BW60'],
-            'macdv': curr['MACD_V'],
-            'squeeze': "🔥Squeeze" if squeeze else "-"
+            'price': curr['Close'], 'atr': curr['ATR14'], 'high_date': high_52_date,
+            'prev_date': prev_date, 'diff_days': diff_days, 'bw_curr': curr['BW50'],
+            'macdv': curr['MACD_V'], 'squeeze': "🔥Squeeze" if squeeze else "-"
         }
     return False, None
 
 def check_weekly_condition(df):
-    """주봉 BB 상단 돌파"""
     if len(df) < 60: return False, None
     df = calculate_common_indicators(df, is_weekly=True)
     if df is None: return False, None
     curr = df.iloc[-1]
-    
     if curr['Close'] > curr['BB_UP']:
         bw_past = df['BandWidth'].iloc[-21]
         bw_change = "감소" if bw_past > curr['BandWidth'] else "증가"
-        
         return True, {
-            'price': curr['Close'],
-            'atr': curr['ATR14'],
-            'bw_curr': curr['BandWidth'],
-            'bw_past': bw_past,
-            'bw_change': bw_change,
-            'macdv': curr['MACD_V']
+            'price': curr['Close'], 'atr': curr['ATR14'], 'bw_curr': curr['BandWidth'],
+            'bw_past': bw_past, 'bw_change': bw_change, 'macdv': curr['MACD_V']
         }
     return False, None
 
 def check_monthly_condition(df):
-    """월봉 ATH -10% 이내"""
     if len(df) < 12: return False, None
     ath_price = df['High'].max()
     curr_price = df['Close'].iloc[-1]
-    
     if curr_price >= ath_price * 0.90:
         ath_idx = df['High'].idxmax()
         month_count = (df['Close'] >= ath_price * 0.90).sum()
         return True, {
-            'price': curr_price,
-            'ath_price': ath_price,
-            'ath_date': ath_idx.strftime('%Y-%m'),
-            'month_count': month_count
+            'price': curr_price, 'ath_price': ath_price,
+            'ath_date': ath_idx.strftime('%Y-%m'), 'month_count': month_count
         }
     return False, None
 
 # ==========================================
-# 섹터/패턴 분석 함수 (기존 유지)
+# 섹터/패턴 분석 함수
 # ==========================================
 def analyze_sector_trend():
     etfs = get_etfs_from_sheet()
@@ -447,20 +425,32 @@ def check_inverse_hs_pattern(df):
     return False, None
 
 def check_pullback_pattern(df):
-    # check_pullback_pattern 구현... (생략 시 기존 로직 유지)
-    return False, None 
+    if len(df) < 60: return False, None
+    df['EMA60'] = df['Close'].ewm(span=60).mean()
+    df['EMA20'] = df['Close'].ewm(span=20).mean()
+    df['VolSMA20'] = df['Volume'].rolling(20).mean()
+    curr = df.iloc[-1]
+    if curr['Close'] < curr['EMA60']: return False, "추세 이탈"
+    recent_high = df['High'].iloc[-10:].max()
+    if curr['Close'] > (recent_high * 0.97): return False, "고점"
+    dist = (curr['Close'] - curr['EMA20']) / curr['EMA20']
+    if dist < -0.03: return False, "지지선 붕괴"
+    if dist > 0.08: return False, "이격도 큼"
+    if curr['Volume'] > curr['VolSMA20']: return False, "매도세"
+    return True, {"pattern": "20일선 눌림목", "support": "EMA20"}
 
 # ==========================================
 # 5. 메인 실행 화면
 # ==========================================
 
-st.write("주식 분석 시스템 (5-Factor 전략, MACD-V, 패턴 분석)")
+st.write("주식 분석 시스템 (5-Factor 전략, MACD-V, 재무 분석)")
 if not supabase: st.warning("⚠️ DB 연결 키 오류")
 
-tab1, tab2 = st.tabs(["📊 신규 종목 발굴", "📉 저장된 종목 눌림목 찾기"])
+# 탭 구성: [신규 발굴] [눌림목 찾기] [재무 분석]
+tab1, tab2, tab3 = st.tabs(["📊 신규 종목 발굴", "📉 저장된 종목 눌림목 찾기", "💰 재무분석"])
 
 with tab1:
-    cols = st.columns(10) # 버튼 10개 배치를 위해 컬럼 수 조정
+    cols = st.columns(10) 
     
     # 1. 추세 섹터
     if cols[0].button("🌍 섹터"):
@@ -469,7 +459,7 @@ with tab1:
         if not res.empty: st.dataframe(res, use_container_width=True)
         else: st.warning("데이터 부족")
 
-    # 2. 일봉 분석 (수정된 로직)
+    # 2. 일봉 분석
     if cols[1].button("🚀 일봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
@@ -507,7 +497,6 @@ with tab1:
                 passed, info = check_weekly_condition(df)
                 if passed:
                     sector = get_stock_sector(rt)
-                    # 주봉에서 52주 신고가 등 추가 정보 필요 시 일봉 데이터 필요하나 여기선 간소화
                     res.append({
                         '종목코드': rt, '섹터': sector, '현재가': f"{info['price']:,.0f}",
                         'ATR(14주)': f"{info['atr']:,.0f}", 'BW현재': f"{info['bw_curr']:.4f}",
@@ -546,7 +535,7 @@ with tab1:
                 save_to_supabase(res, "Monthly_ATH")
             else: st.warning("조건 만족 없음")
 
-    # [NEW] 5. 일+월봉 분석
+    # [NEW] 5. 일+월봉 분석 (교차)
     if cols[4].button("일+월봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
@@ -577,7 +566,7 @@ with tab1:
                 save_to_supabase(res, "Daily_Monthly")
             else: st.warning("조건 만족 없음")
 
-    # [NEW] 6. 일+주봉 분석
+    # [NEW] 6. 일+주봉 분석 (교차)
     if cols[5].button("일+주봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
@@ -608,7 +597,7 @@ with tab1:
                 save_to_supabase(res, "Daily_Weekly")
             else: st.warning("조건 만족 없음")
 
-    # [NEW] 7. 주+월봉 분석
+    # [NEW] 7. 주+월봉 분석 (교차)
     if cols[6].button("주+월봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
@@ -745,7 +734,6 @@ with tab2:
                     cond = ""
                     if curr['MACD_V'] > 60: cond = "🔥 공격적 추세"
                     
-                    # 20일선 눌림목 로직 (간단 구현)
                     ema20 = df['Close'].ewm(span=20).mean().iloc[-1]
                     if (curr['Close'] > ema20) and ((curr['Close']-ema20)/ema20 < 0.03):
                         cond = "📉 20일선 눌림목"
@@ -764,6 +752,32 @@ with tab2:
                 st.success(f"{len(res)}개 발견!")
                 st.dataframe(pd.DataFrame(res), use_container_width=True)
             else: st.warning("조건 만족 종목 없음")
+
+# [NEW] 재무분석 탭
+with tab3:
+    st.markdown("### 💰 재무 지표 분석")
+    st.info("yahoo_fin 라이브러리를 사용하여 재무 정보를 가져옵니다. (속도 느릴 수 있음)")
+    if st.button("📊 재무 지표 가져오기"):
+        tickers = get_tickers_from_sheet()
+        if not tickers: st.error("티커 없음")
+        else:
+            bar = st.progress(0); f_res = []
+            for i, t in enumerate(tickers):
+                bar.progress((i+1)/len(tickers))
+                try:
+                    data = si.get_quote_table(t)
+                    f_res.append({
+                        "종목": t,
+                        "시가총액": data.get("Market Cap"),
+                        "PER(TTM)": data.get("PE Ratio (TTM)"),
+                        "EPS(TTM)": data.get("EPS (TTM)"),
+                        "배당수익률": data.get("Forward Dividend & Yield"),
+                        "52주 범위": data.get("52 Week Range")
+                    })
+                except: continue
+            bar.empty()
+            if f_res: st.dataframe(pd.DataFrame(f_res), use_container_width=True)
+            else: st.warning("데이터를 가져오지 못했습니다.")
 
 st.markdown("---")
 with st.expander("🗄️ 전체 저장 기록 보기 / 관리"):

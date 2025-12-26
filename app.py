@@ -196,14 +196,15 @@ def save_to_supabase(data_list, strategy_name):
     except Exception as e:
         st.error(f"DB 저장 실패: {e}")
 
-# [NEW] Supabase에서 최신 Quant 데이터 불러오기 (캐싱)
+# ==========================================
+# [NEW] Supabase에서 최신 Quant 데이터 불러오기
+# ==========================================
 @st.cache_data(ttl=600) # 10분 캐싱
 def fetch_latest_quant_data_from_db():
     """DB에서 가장 최신의 EPS 데이터를 가져와 딕셔너리로 반환"""
     if not supabase: return {}
     try:
         # 모든 데이터 가져오기 (created_at 내림차순)
-        # 데이터가 많아지면 limit을 걸거나 날짜 필터링 필요
         response = supabase.table("quant_data").select("*").order("created_at", desc=True).execute()
         if not response.data: return {}
         
@@ -224,7 +225,7 @@ def fetch_latest_quant_data_from_db():
             }
         return result_dict
     except Exception as e:
-        st.error(f"DB 데이터 로드 실패: {e}")
+        # st.error(f"DB 데이터 로드 실패: {e}")
         return {}
 
 def normalize_qt_ticker(t):
@@ -234,7 +235,7 @@ def normalize_qt_ticker(t):
     if '.' in t_str: return t_str.split('.')[0]
     return t_str
 
-# 전역 변수로 DB 데이터 로드 (앱 실행 시 1회)
+# 앱 시작 시 DB 데이터 로드 (캐시 사용)
 GLOBAL_QUANT_DATA = fetch_latest_quant_data_from_db()
 
 def get_eps_changes_from_db(ticker):
@@ -908,15 +909,31 @@ with tab4:
                     })
                 
                 # 대량 Insert (배치 처리 가능하나, 일단 전체)
-                # 기존 데이터 중복 방지를 위해 날짜별 관리가 필요하나, 여기선 append
-                # *실제 운영 시에는 당일 중복 제거 로직 필요 가능
                 supabase.table("quant_data").insert(rows_to_insert).execute()
+                
+                # [중요] 캐시 초기화 (즉시 반영을 위해)
+                fetch_latest_quant_data_from_db.clear()
+                # 전역 변수 갱신
+                GLOBAL_QUANT_DATA = fetch_latest_quant_data_from_db()
                 
                 st.success(f"✅ DB 업로드 완료! (총 {len(rows_to_insert)}개 데이터)")
                 st.info("이제 다른 탭에서 분석 시, 이 데이터가 자동으로 표시됩니다.")
                 
         except Exception as e:
             st.error(f"작업 실패: {e}")
+
+    # [NEW] 현재 DB 데이터 확인 섹션
+    st.markdown("---")
+    st.markdown("#### 👁️ 현재 DB에 저장된 데이터 확인 (최신 100개)")
+    if st.button("데이터 조회하기"):
+        try:
+            response = supabase.table("quant_data").select("*").order("created_at", desc=True).limit(100).execute()
+            if response.data:
+                st.dataframe(pd.DataFrame(response.data), use_container_width=True)
+            else:
+                st.warning("데이터가 없습니다.")
+        except Exception as e:
+            st.error(f"조회 실패: {e}")
 
 st.markdown("---")
 with st.expander("🗄️ 전체 저장 기록 보기 / 관리"):

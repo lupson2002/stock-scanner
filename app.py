@@ -210,7 +210,7 @@ def normalize_ticker_for_db_storage(t):
     # 1. 미국 주식 (-US)
     if t_str.endswith("-US"):
         clean = t_str[:-3]  # -US 제거
-        # 본주/우선주 충돌 방지를 위해 점(.)을 하이픈(-)으로 변경
+        # 점(.)을 하이픈(-)으로 변경
         return clean.replace('.', '-')
 
     # 2. 홍콩 (-HK)
@@ -240,7 +240,7 @@ def normalize_ticker_for_app_lookup(t):
     if not t: return ""
     t_str = str(t).upper().strip()
     
-    # 한국 주식 (.KS, .KQ 제거)
+    # 한국 주식
     if t_str.endswith(".KS"): return t_str[:-3]
     if t_str.endswith(".KQ"): return t_str[:-3]
     
@@ -251,26 +251,26 @@ def normalize_ticker_for_app_lookup(t):
     return t_str
 
 # ==========================================
-# [중요] DB 데이터 로드 (캐시) - TEXT 타입 대응
+# [중요] DB 데이터 로드 (캐시) - TEXT 타입
 # ==========================================
 @st.cache_data(ttl=600) 
 def fetch_latest_quant_data_from_db():
     if not supabase: return {}
     try:
-        # 최신순 정렬 (데이터는 이제 문자열입니다)
+        # DB에서 데이터를 모두 텍스트로 가져옴
         response = supabase.table("quant_data").select("*").order("created_at", desc=True).execute()
         if not response.data: return {}
         
         df = pd.DataFrame(response.data)
         if df.empty: return {}
         
-        # 티커 중복 제거
+        # 티커 중복 제거 (최신순)
         df_latest = df.drop_duplicates(subset='ticker', keep='first')
         
         result_dict = {}
         for _, row in df_latest.iterrows():
             result_dict[row['ticker']] = {
-                # 가져올 때 None이면 "-"로 처리
+                # 값이 없으면 대시(-) 처리
                 '1w': str(row.get('change_1w') or "-"),
                 '1m': str(row.get('change_1m') or "-"),
                 '3m': str(row.get('change_3m') or "-")
@@ -290,7 +290,7 @@ def get_eps_changes_from_db(ticker):
     return "-", "-", "-"
 
 # ==========================================
-# 4. 분석 알고리즘 (생략된 부분 없음)
+# 4. 분석 알고리즘 (지표 계산 & 패턴)
 # ==========================================
 
 def find_extrema(df, order=3):
@@ -937,8 +937,11 @@ with tab4:
             except Exception as e:
                 st.error(f"초기화 실패 (Supabase 권한 확인 필요): {e}")
 
+    # [디버깅 옵션]
+    show_debug_log = st.checkbox("🔍 디버깅 로그 보기 (왜 저장이 안 되는지 확인)")
+
     # --- 서브 함수: 엑셀 시트 파싱 (화이트리스트 필터링 추가, 문자열 처리) ---
-    def parse_sheet_ticker_value(sheet_df, allowed_tickers):
+    def parse_sheet_ticker_value(sheet_df, allowed_tickers, debug_mode=False):
         extracted = {}
         for index, row in sheet_df.iterrows():
             try:
@@ -949,6 +952,10 @@ with tab4:
                 # 1. 정규화 (Quant -> DB Format)
                 norm_ticker = normalize_ticker_for_db_storage(raw_ticker)
                 
+                # [디버깅] 특정 티커가 어떻게 처리되는지 확인
+                if debug_mode and "RKLB" in norm_ticker:
+                    st.write(f"📢 [DEBUG] 발견된 티커: {raw_ticker} -> 정규화: {norm_ticker} -> 화이트리스트 포함 여부: {norm_ticker in allowed_tickers}")
+
                 # 2. [핵심] 화이트리스트 필터링
                 if norm_ticker not in allowed_tickers:
                     continue
@@ -988,7 +995,14 @@ with tab4:
             
             st.success(f"관리 대상 종목 {len(allowed_db_tickers)}개를 확인했습니다. 필터링을 시작합니다.")
 
+            if show_debug_log:
+                if "RKLB" in allowed_db_tickers:
+                    st.success("✅ RKLB가 관리 종목(TGT) 목록에 포함되어 있습니다.")
+                else:
+                    st.error("❌ RKLB가 관리 종목(TGT) 목록에 없습니다! 구글 시트를 확인하세요.")
+
             # 1. 엑셀 파일 읽기 (모든 데이터를 문자열로 읽기)
+            # [중요] dtype=str 옵션을 줘서 처음부터 문자로 읽어들임
             xls = pd.read_excel(uploaded_file, sheet_name=None, header=None, dtype=str)
             
             sheet_map = {'1w': None, '1m': None, '3m': None}
@@ -1002,9 +1016,9 @@ with tab4:
                 st.error("엑셀 파일에 1w, 1m, 3m 시트가 모두 있어야 합니다.")
             else:
                 # 2. 파싱 (화이트리스트 전달)
-                data_1w = parse_sheet_ticker_value(sheet_map['1w'], allowed_db_tickers)
-                data_1m = parse_sheet_ticker_value(sheet_map['1m'], allowed_db_tickers)
-                data_3m = parse_sheet_ticker_value(sheet_map['3m'], allowed_db_tickers)
+                data_1w = parse_sheet_ticker_value(sheet_map['1w'], allowed_db_tickers, show_debug_log)
+                data_1m = parse_sheet_ticker_value(sheet_map['1m'], allowed_db_tickers, show_debug_log)
+                data_3m = parse_sheet_ticker_value(sheet_map['3m'], allowed_db_tickers, show_debug_log)
                 
                 # 3. 통합
                 all_tickers = set(data_1w.keys()) | set(data_1m.keys()) | set(data_3m.keys())
@@ -1039,6 +1053,7 @@ with tab4:
                         v_1m = data_1m.get(t, "-")
                         v_3m = data_3m.get(t, "-")
                         
+                        # 중복 체크 (문자열 그대로 비교)
                         if t in existing_map:
                             e_1w, e_1m, e_3m = existing_map[t]
                             if (e_1w == v_1w) and (e_1m == v_1m) and (e_3m == v_3m):
@@ -1053,12 +1068,15 @@ with tab4:
                         })
                     
                     if rows_to_insert:
+                        # 100개씩 나눠서 저장
                         chunk_size = 100
                         for i in range(0, len(rows_to_insert), chunk_size):
                             chunk = rows_to_insert[i:i+chunk_size]
                             supabase.table("quant_data").insert(chunk).execute()
                         
                         st.success(f"✅ DB 업로드 완료! (TGT 필터링 적용됨. 신규: {len(rows_to_insert)}건, 중복생략: {skipped_count}건)")
+                        
+                        # 캐시 초기화
                         fetch_latest_quant_data_from_db.clear()
                         GLOBAL_QUANT_DATA = fetch_latest_quant_data_from_db()
                     else:

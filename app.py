@@ -7,12 +7,6 @@ from supabase import create_client, Client
 from scipy.signal import argrelextrema
 import time
 
-# [NEW] 재무분석용 라이브러리
-try:
-    from yahoo_fin import stock_info as si
-except ImportError:
-    st.error("yahoo_fin 라이브러리가 설치되지 않았습니다. (pip install yahoo_fin requests_html)")
-
 # =========================================================
 # [설정] Supabase 연결 정보
 # =========================================================
@@ -446,7 +440,6 @@ def check_pullback_pattern(df):
 st.write("주식 분석 시스템 (5-Factor 전략, MACD-V, 재무 분석)")
 if not supabase: st.warning("⚠️ DB 연결 키 오류")
 
-# 탭 구성: [신규 발굴] [눌림목 찾기] [재무 분석]
 tab1, tab2, tab3 = st.tabs(["📊 신규 종목 발굴", "📉 저장된 종목 눌림목 찾기", "💰 재무분석"])
 
 with tab1:
@@ -756,7 +749,7 @@ with tab2:
 # [NEW] 재무분석 탭
 with tab3:
     st.markdown("### 💰 재무 지표 분석")
-    st.info("yahoo_fin 라이브러리를 사용하여 재무 정보를 가져옵니다. (속도 느릴 수 있음)")
+    st.info("yfinance 데이터를 기반으로 핵심 재무 지표를 분석합니다.")
     if st.button("📊 재무 지표 가져오기"):
         tickers = get_tickers_from_sheet()
         if not tickers: st.error("티커 없음")
@@ -764,20 +757,31 @@ with tab3:
             bar = st.progress(0); f_res = []
             for i, t in enumerate(tickers):
                 bar.progress((i+1)/len(tickers))
+                rt, _ = smart_download(t, "1d", "5d")
                 try:
-                    data = si.get_quote_table(t)
+                    tick = yf.Ticker(rt); info = tick.info
+                    if not info: continue
+                    mc = info.get('marketCap', 0)
+                    mc_str = f"{mc/1000000000000:.1f}조" if mc > 1000000000000 else f"{mc/100000000:.0f}억" if mc else "-"
+                    per = info.get('trailingPE', info.get('forwardPE', '-'))
+                    if isinstance(per, (int, float)): per = f"{per:.2f}"
+                    eps = info.get('trailingEps', info.get('forwardEps', '-'))
+                    div = info.get('dividendYield', 0)
+                    div_str = f"{div*100:.2f}%" if div else "-"
+                    pbr = info.get('priceToBook', '-'); roe = info.get('returnOnEquity', '-')
+                    if isinstance(pbr, (int, float)): pbr = f"{pbr:.2f}"
+                    if isinstance(roe, (int, float)): roe = f"{roe*100:.2f}%"
                     f_res.append({
-                        "종목": t,
-                        "시가총액": data.get("Market Cap"),
-                        "PER(TTM)": data.get("PE Ratio (TTM)"),
-                        "EPS(TTM)": data.get("EPS (TTM)"),
-                        "배당수익률": data.get("Forward Dividend & Yield"),
-                        "52주 범위": data.get("52 Week Range")
+                        "종목": rt, "기업명": info.get('shortName', '-'), "시가총액": mc_str,
+                        "PER": per, "EPS": eps, "PBR": pbr, "ROE": roe, "배당수익률": div_str,
+                        "목표주가": info.get('targetMeanPrice', '-')
                     })
                 except: continue
             bar.empty()
-            if f_res: st.dataframe(pd.DataFrame(f_res), use_container_width=True)
-            else: st.warning("데이터를 가져오지 못했습니다.")
+            if f_res:
+                st.success(f"✅ 총 {len(f_res)}개 기업 재무 분석 완료")
+                st.dataframe(pd.DataFrame(f_res), use_container_width=True)
+            else: st.warning("데이터 실패")
 
 st.markdown("---")
 with st.expander("🗄️ 전체 저장 기록 보기 / 관리"):

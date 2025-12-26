@@ -17,7 +17,7 @@ SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJ
 # 1. 페이지 설정 및 DB 연결
 # ==========================================
 st.set_page_config(page_title="Pro 주식 검색기", layout="wide")
-st.title("📈 Pro 주식 검색기: 섹터/기술적/재무 통합 분석")
+st.title("📈 Pro 주식 검색기: 섹터/국가/기술적/재무 통합 분석")
 
 @st.cache_resource
 def init_supabase():
@@ -36,6 +36,9 @@ STOCK_GID = '0'
 STOCK_CSV_URL = f'https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={STOCK_GID}'
 ETF_GID = '2023286696'
 ETF_CSV_URL = f'https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={ETF_GID}'
+# [NEW] 국가 ETF 시트
+COUNTRY_GID = '1247750129'
+COUNTRY_CSV_URL = f'https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={COUNTRY_GID}'
 
 # ==========================================
 # 3. 공통 함수 정의
@@ -68,6 +71,27 @@ def get_etfs_from_sheet():
         return etf_list
     except Exception as e:
         st.error(f"ETF 시트 읽기 실패: {e}")
+        return []
+
+# [NEW] 국가 ETF 읽어오기
+def get_country_etfs_from_sheet():
+    try:
+        df = pd.read_csv(COUNTRY_CSV_URL, header=None)
+        etf_list = []
+        for index, row in df.iterrows():
+            raw_ticker = str(row[0]).strip()
+            if not raw_ticker or raw_ticker.lower() in ['ticker', 'symbol', '종목코드', '티커', 'nan']:
+                continue
+            if ':' in raw_ticker:
+                ticker = raw_ticker.split(':')[-1].strip()
+            else:
+                ticker = raw_ticker
+            name = str(row[1]).strip() if len(row) > 1 else ticker
+            if ticker:
+                etf_list.append((ticker, name))
+        return etf_list
+    except Exception as e:
+        st.error(f"국가 ETF 시트 읽기 실패: {e}")
         return []
 
 def get_unique_tickers_from_db():
@@ -443,7 +467,7 @@ if not supabase: st.warning("⚠️ DB 연결 키 오류")
 tab1, tab2, tab3 = st.tabs(["📊 신규 종목 발굴", "📉 저장된 종목 눌림목 찾기", "💰 재무분석"])
 
 with tab1:
-    cols = st.columns(10) 
+    cols = st.columns(11) # 컬럼 수 증가 (10 -> 11)
     
     # 1. 추세 섹터
     if cols[0].button("🌍 섹터"):
@@ -452,8 +476,34 @@ with tab1:
         if not res.empty: st.dataframe(res, use_container_width=True)
         else: st.warning("데이터 부족")
 
-    # 2. 일봉 분석
-    if cols[1].button("🚀 일봉"):
+    # [NEW] 2. 국가 ETF (섹터 바로 옆)
+    if cols[1].button("🏳️ 국가"):
+        tickers = get_country_etfs_from_sheet()
+        if tickers:
+            st.info(f"[국가 ETF] {len(tickers)}개 일봉 5-Factor 분석 시작...")
+            bar = st.progress(0); res = []
+            for i, (t, n) in enumerate(tickers):
+                bar.progress((i+1)/len(tickers))
+                rt, df = smart_download(t, "1d", "2y")
+                passed, info = check_daily_condition(df)
+                if passed:
+                    # 섹터 대신 국가명 표시
+                    res.append({
+                        '종목코드': rt, '국가/ETF명': n, '현재가': f"{info['price']:,.0f}",
+                        'ATR(14)': f"{info['atr']:,.0f}", '스퀴즈': info['squeeze'],
+                        '현52주신고가일': info['high_date'], '전52주신고가일': info['prev_date'],
+                        '차이일': f"{info['diff_days']}일", 'BW현재': f"{info['bw_curr']:.4f}",
+                        'MACD-V': f"{info['macdv']:.2f}", 'BW_Value': f"{info['bw_curr']:.4f}", 'MACD_V_Value': f"{info['macdv']:.2f}"
+                    })
+            bar.empty()
+            if res:
+                st.success(f"[국가] {len(res)}개 발견!")
+                st.dataframe(pd.DataFrame(res).drop(columns=['BW_Value', 'MACD_V_Value']))
+                save_to_supabase(res, "Country_Daily")
+            else: st.warning("조건 만족 종목 없음")
+
+    # 3. 일봉 분석
+    if cols[2].button("🚀 일봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info(f"[일봉 5-Factor] {len(tickers)}개 분석 시작...")
@@ -478,8 +528,8 @@ with tab1:
                 save_to_supabase(res, "Daily_5Factor")
             else: st.warning("조건 만족 없음")
 
-    # 3. 주봉 분석
-    if cols[2].button("📅 주봉"):
+    # 4. 주봉 분석
+    if cols[3].button("📅 주봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info(f"[주봉] {len(tickers)}개 분석 시작...")
@@ -503,8 +553,8 @@ with tab1:
                 save_to_supabase(res, "Weekly")
             else: st.warning("조건 만족 없음")
 
-    # 4. 월봉 분석
-    if cols[3].button("🗓️ 월봉"):
+    # 5. 월봉 분석
+    if cols[4].button("🗓️ 월봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info(f"[월봉 ATH] {len(tickers)}개 분석 시작...")
@@ -528,8 +578,8 @@ with tab1:
                 save_to_supabase(res, "Monthly_ATH")
             else: st.warning("조건 만족 없음")
 
-    # [NEW] 5. 일+월봉 분석 (교차)
-    if cols[4].button("일+월봉"):
+    # 6. 일+월봉 분석 (교차)
+    if cols[5].button("일+월봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info("일봉(5-Factor) + 월봉(ATH) 교차 분석 중...")
@@ -559,8 +609,8 @@ with tab1:
                 save_to_supabase(res, "Daily_Monthly")
             else: st.warning("조건 만족 없음")
 
-    # [NEW] 6. 일+주봉 분석 (교차)
-    if cols[5].button("일+주봉"):
+    # 7. 일+주봉 분석 (교차)
+    if cols[6].button("일+주봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info("일봉(5-Factor) + 주봉(BB) 교차 분석 중...")
@@ -590,8 +640,8 @@ with tab1:
                 save_to_supabase(res, "Daily_Weekly")
             else: st.warning("조건 만족 없음")
 
-    # [NEW] 7. 주+월봉 분석 (교차)
-    if cols[6].button("주+월봉"):
+    # 8. 주+월봉 분석 (교차)
+    if cols[7].button("주+월봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info("주봉(BB) + 월봉(ATH) 교차 분석 중...")
@@ -620,8 +670,8 @@ with tab1:
                 save_to_supabase(res, "Weekly_Monthly")
             else: st.warning("조건 만족 없음")
 
-    # 8. 통합 분석
-    if cols[7].button("⚡ 통합"):
+    # 9. 통합 분석
+    if cols[8].button("⚡ 통합"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info("[통합] 일+주+월봉 모두 만족하는 종목 검색 중...")
@@ -657,8 +707,8 @@ with tab1:
                 save_to_supabase(res, "Integrated_Triple")
             else: st.warning("3가지 조건을 모두 만족하는 종목이 없습니다.")
 
-    # 9. 컵위드핸들
-    if cols[8].button("🏆 컵핸들"):
+    # 10. 컵위드핸들
+    if cols[9].button("🏆 컵핸들"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info("[컵핸들] 분석 중...")
@@ -683,8 +733,8 @@ with tab1:
                 save_to_supabase(res, "CupHandle")
             else: st.warning("조건 만족 없음")
 
-    # 10. 역H&S
-    if cols[9].button("👤 역H&S"):
+    # 11. 역H&S
+    if cols[10].button("👤 역H&S"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info("[역H&S] 분석 중...")

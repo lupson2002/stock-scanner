@@ -6,6 +6,7 @@ from datetime import datetime
 from supabase import create_client, Client
 from scipy.signal import argrelextrema
 import time
+import re # 정규표현식 사용 (티커 매칭용)
 
 # =========================================================
 # [설정] Supabase 연결 정보
@@ -17,7 +18,7 @@ SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJ
 # 1. 페이지 설정 및 DB 연결
 # ==========================================
 st.set_page_config(page_title="Pro 주식 검색기", layout="wide")
-st.title("📈 Pro 주식 검색기: 섹터/국가/기술적/재무 통합 분석")
+st.title("📈 Pro 주식 검색기: 섹터/국가/기술적/퀀티와이즈 통합")
 
 @st.cache_resource
 def init_supabase():
@@ -36,7 +37,6 @@ STOCK_GID = '0'
 STOCK_CSV_URL = f'https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={STOCK_GID}'
 ETF_GID = '2023286696'
 ETF_CSV_URL = f'https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={ETF_GID}'
-# [NEW] 국가 ETF 시트
 COUNTRY_GID = '1247750129'
 COUNTRY_CSV_URL = f'https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={COUNTRY_GID}'
 
@@ -73,7 +73,6 @@ def get_etfs_from_sheet():
         st.error(f"ETF 시트 읽기 실패: {e}")
         return []
 
-# [NEW] 국가 ETF 읽어오기
 def get_country_etfs_from_sheet():
     try:
         df = pd.read_csv(COUNTRY_CSV_URL, header=None)
@@ -464,19 +463,17 @@ def check_pullback_pattern(df):
 st.write("주식 분석 시스템 (5-Factor 전략, MACD-V, 재무 분석)")
 if not supabase: st.warning("⚠️ DB 연결 키 오류")
 
-tab1, tab2, tab3 = st.tabs(["📊 신규 종목 발굴", "📉 저장된 종목 눌림목 찾기", "💰 재무분석"])
+tab1, tab2, tab3, tab4 = st.tabs(["📊 신규 종목 발굴", "📉 저장된 종목 눌림목 찾기", "💰 재무분석", "📂 엑셀 데이터 매칭"])
 
 with tab1:
-    cols = st.columns(11) # 컬럼 수 증가 (10 -> 11)
+    cols = st.columns(11) 
     
-    # 1. 추세 섹터
     if cols[0].button("🌍 섹터"):
         st.info("ETF 섹터 분석 중...")
         res = analyze_sector_trend()
         if not res.empty: st.dataframe(res, use_container_width=True)
         else: st.warning("데이터 부족")
 
-    # [NEW] 2. 국가 ETF (섹터 바로 옆)
     if cols[1].button("🏳️ 국가"):
         tickers = get_country_etfs_from_sheet()
         if tickers:
@@ -487,7 +484,6 @@ with tab1:
                 rt, df = smart_download(t, "1d", "2y")
                 passed, info = check_daily_condition(df)
                 if passed:
-                    # 섹터 대신 국가명 표시
                     res.append({
                         '종목코드': rt, '국가/ETF명': n, '현재가': f"{info['price']:,.0f}",
                         'ATR(14)': f"{info['atr']:,.0f}", '스퀴즈': info['squeeze'],
@@ -502,7 +498,6 @@ with tab1:
                 save_to_supabase(res, "Country_Daily")
             else: st.warning("조건 만족 종목 없음")
 
-    # 3. 일봉 분석
     if cols[2].button("🚀 일봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
@@ -528,7 +523,6 @@ with tab1:
                 save_to_supabase(res, "Daily_5Factor")
             else: st.warning("조건 만족 없음")
 
-    # 4. 주봉 분석
     if cols[3].button("📅 주봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
@@ -553,7 +547,6 @@ with tab1:
                 save_to_supabase(res, "Weekly")
             else: st.warning("조건 만족 없음")
 
-    # 5. 월봉 분석
     if cols[4].button("🗓️ 월봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
@@ -578,7 +571,6 @@ with tab1:
                 save_to_supabase(res, "Monthly_ATH")
             else: st.warning("조건 만족 없음")
 
-    # 6. 일+월봉 분석 (교차)
     if cols[5].button("일+월봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
@@ -589,11 +581,9 @@ with tab1:
                 rt, df_d = smart_download(t, "1d", "2y")
                 pass_d, info_d = check_daily_condition(df_d)
                 if not pass_d: continue
-                
                 _, df_m = smart_download(t, "1mo", "max")
                 pass_m, info_m = check_monthly_condition(df_m)
                 if not pass_m: continue
-                
                 sector = get_stock_sector(rt)
                 res.append({
                     '종목코드': rt, '섹터': sector, '현재가': f"{info_d['price']:,.0f}",
@@ -609,7 +599,6 @@ with tab1:
                 save_to_supabase(res, "Daily_Monthly")
             else: st.warning("조건 만족 없음")
 
-    # 7. 일+주봉 분석 (교차)
     if cols[6].button("일+주봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
@@ -620,16 +609,13 @@ with tab1:
                 rt, df_d = smart_download(t, "1d", "2y")
                 pass_d, info_d = check_daily_condition(df_d)
                 if not pass_d: continue
-                
                 _, df_w = smart_download(t, "1wk", "2y")
                 pass_w, info_w = check_weekly_condition(df_w)
                 if not pass_w: continue
-                
                 sector = get_stock_sector(rt)
                 res.append({
                     '종목코드': rt, '섹터': sector, '현재가': f"{info_d['price']:,.0f}",
-                    '스퀴즈': info_d['squeeze'], 
-                    '주봉BW': f"{info_w['bw_curr']:.4f}", '주봉BW변화': info_w['bw_change'],
+                    '스퀴즈': info_d['squeeze'], '주봉BW': f"{info_w['bw_curr']:.4f}", '주봉BW변화': info_w['bw_change'],
                     '현52주신고가일': info_d['high_date'], '전52주신고가일': info_d['prev_date'],
                     '차이일': f"{info_d['diff_days']}일", 'BW_Value': f"{info_w['bw_curr']:.4f}", 'MACD_V_Value': f"{info_d['macdv']:.2f}"
                 })
@@ -640,7 +626,6 @@ with tab1:
                 save_to_supabase(res, "Daily_Weekly")
             else: st.warning("조건 만족 없음")
 
-    # 8. 주+월봉 분석 (교차)
     if cols[7].button("주+월봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
@@ -651,11 +636,9 @@ with tab1:
                 rt, df_w = smart_download(t, "1wk", "2y")
                 pass_w, info_w = check_weekly_condition(df_w)
                 if not pass_w: continue
-                
                 _, df_m = smart_download(t, "1mo", "max")
                 pass_m, info_m = check_monthly_condition(df_m)
                 if not pass_m: continue
-                
                 sector = get_stock_sector(rt)
                 res.append({
                     '종목코드': rt, '섹터': sector, '현재가': f"{info_w['price']:,.0f}",
@@ -670,7 +653,6 @@ with tab1:
                 save_to_supabase(res, "Weekly_Monthly")
             else: st.warning("조건 만족 없음")
 
-    # 9. 통합 분석
     if cols[8].button("⚡ 통합"):
         tickers = get_tickers_from_sheet()
         if tickers:
@@ -681,15 +663,12 @@ with tab1:
                 rt, df_d = smart_download(t, "1d", "2y")
                 pass_d, info_d = check_daily_condition(df_d)
                 if not pass_d: continue
-                
                 _, df_w = smart_download(t, "1wk", "2y")
                 pass_w, info_w = check_weekly_condition(df_w)
                 if not pass_w: continue
-                
                 _, df_m = smart_download(t, "1mo", "max")
                 pass_m, info_m = check_monthly_condition(df_m)
                 if not pass_m: continue
-                
                 sector = get_stock_sector(rt)
                 res.append({
                     '종목코드': rt, '섹터': sector, '현재가': f"{info_d['price']:,.0f}",
@@ -707,7 +686,6 @@ with tab1:
                 save_to_supabase(res, "Integrated_Triple")
             else: st.warning("3가지 조건을 모두 만족하는 종목이 없습니다.")
 
-    # 10. 컵위드핸들
     if cols[9].button("🏆 컵핸들"):
         tickers = get_tickers_from_sheet()
         if tickers:
@@ -733,7 +711,6 @@ with tab1:
                 save_to_supabase(res, "CupHandle")
             else: st.warning("조건 만족 없음")
 
-    # 11. 역H&S
     if cols[10].button("👤 역H&S"):
         tickers = get_tickers_from_sheet()
         if tickers:
@@ -759,98 +736,194 @@ with tab1:
                 save_to_supabase(res, "InverseHS")
             else: st.warning("조건 만족 없음")
 
-# [NEW] 재무분석 탭 (yfinance로 변경하여 안정성 확보)
+with tab2:
+    st.markdown("### 📉 저장된 종목 중 눌림목/급등주 찾기")
+    if st.button("🔍 눌림목 & 급등 패턴 분석"):
+        db_tickers = get_unique_tickers_from_db()
+        if not db_tickers: st.warning("DB 데이터 없음")
+        else:
+            st.info(f"{len(db_tickers)}개 종목 재분석 중...")
+            bar = st.progress(0); res = []
+            for i, t in enumerate(db_tickers):
+                bar.progress((i+1)/len(db_tickers))
+                rt, df = smart_download(t, "1d", "2y")
+                try:
+                    df = calculate_common_indicators(df, False)
+                    if df is None: continue
+                    curr = df.iloc[-1]
+                    cond = ""
+                    if curr['MACD_V'] > 60: cond = "🔥 공격적 추세"
+                    ema20 = df['Close'].ewm(span=20).mean().iloc[-1]
+                    if (curr['Close'] > ema20) and ((curr['Close']-ema20)/ema20 < 0.03):
+                        cond = "📉 20일선 눌림목"
+                    if (curr['Close'] > curr['EMA200']) and (-100 <= curr['MACD_V'] <= -50):
+                         cond = "🧲 MACD-V 과매도"
+                    if cond:
+                        res.append({
+                            '종목코드': rt, '패턴': cond, '현재가': f"{curr['Close']:,.0f}",
+                            'MACD-V': f"{curr['MACD_V']:.2f}", 'EMA20': f"{ema20:,.0f}"
+                        })
+                except: continue
+            bar.empty()
+            if res:
+                st.success(f"{len(res)}개 발견!")
+                st.dataframe(pd.DataFrame(res), use_container_width=True)
+            else: st.warning("조건 만족 종목 없음")
+
 with tab3:
-    st.markdown("### 💰 재무 지표 분석 & EPS Trend")
+    st.markdown("### 💰 재무 지표 분석 & EPS Trend (yfinance)")
     st.info("yfinance 데이터를 기반으로 핵심 재무 지표 및 EPS 추정치 변화를 분석합니다.")
-    
     if st.button("📊 재무 지표 가져오기"):
         tickers = get_tickers_from_sheet()
-        if not tickers: 
-            st.error("티커 없음")
+        if not tickers: st.error("티커 없음")
         else:
-            bar = st.progress(0)
-            f_res = []
-            
+            bar = st.progress(0); f_res = []
             for i, t in enumerate(tickers):
                 bar.progress((i + 1) / len(tickers))
                 real_ticker, _ = smart_download(t, "1d", "5d") 
-                
                 try:
                     tick = yf.Ticker(real_ticker)
                     info = tick.info
-                    
                     if not info: continue
-
-                    # 시가총액
                     mkt_cap = info.get('marketCap', 0)
-                    if mkt_cap and mkt_cap > 1000000000000: mkt_cap_str = f"{mkt_cap/1000000000000:.1f}조"
-                    elif mkt_cap: mkt_cap_str = f"{mkt_cap/100000000:.0f}억"
-                    else: mkt_cap_str = "-"
-
-                    # 매출 & EPS 성장률
+                    mkt_cap_str = f"{mkt_cap/1000000000000:.1f}조" if mkt_cap > 1000000000000 else f"{mkt_cap/100000000:.0f}억" if mkt_cap else "-"
                     rev_growth = info.get('revenueGrowth', 0)
                     rev_str = f"{rev_growth*100:.1f}%" if rev_growth else "-"
                     eps_growth = info.get('earningsGrowth', 0)
                     eps_growth_str = f"{eps_growth*100:.1f}%" if eps_growth else "-"
-                    
-                    # Forward EPS & PEG
                     fwd_eps = info.get('forwardEps', '-')
                     peg = info.get('pegRatio', '-')
-
-                    # EPS Trend (30일/90일 변화)
-                    # trend 데이터가 없는 경우도 많으므로 예외처리
                     try:
-                        # eps_trend는 리스트 형태 [0]:Current Year, [1]:Next Year ...
-                        # usually index 0 is current year
                         trend_data = tick.eps_trend
                         if trend_data:
-                            # 0y: Current Year (2024 etc)
                             curr_year_data = trend_data[0] 
-                            # 키 값 확인: 'current', '7daysAgo', '30daysAgo', '60daysAgo', '90daysAgo'
                             curr_est = curr_year_data.get('current', 0)
                             ago30 = curr_year_data.get('30daysAgo', 0)
                             ago90 = curr_year_data.get('90daysAgo', 0)
-                            
                             trend_30 = "↗️" if curr_est > ago30 else "↘️" if curr_est < ago30 else "-"
                             trend_90 = "↗️" if curr_est > ago90 else "↘️" if curr_est < ago90 else "-"
-                            
                             eps_trend_str = f"30일{trend_30} | 90일{trend_90}"
-                        else:
-                            eps_trend_str = "-"
-                    except:
-                        eps_trend_str = "-"
-
-                    # 투자의견 & 목표주가
+                        else: eps_trend_str = "-"
+                    except: eps_trend_str = "-"
                     rec = info.get('recommendationKey', '-').upper().replace('_', ' ')
                     target = info.get('targetMeanPrice')
                     curr_p = info.get('currentPrice', 0)
                     upside = f"{(target - curr_p) / curr_p * 100:.1f}%" if (target and curr_p) else "-"
-
                     f_res.append({
-                        "종목": real_ticker,
-                        "섹터": info.get('sector', '-'),
-                        "산업": info.get('industry', '-'),
-                        "시가총액": mkt_cap_str,
-                        "매출성장(YoY)": rev_str,
-                        "EPS성장(YoY)": eps_growth_str,
-                        "선행EPS": fwd_eps,
-                        "PEG": peg,
-                        "EPS추세(올해)": eps_trend_str,
-                        "투자의견": rec,
-                        "상승여력": upside
+                        "종목": real_ticker, "섹터": info.get('sector', '-'), "산업": info.get('industry', '-'),
+                        "시가총액": mkt_cap_str, "매출성장(YoY)": rev_str, "EPS성장(YoY)": eps_growth_str,
+                        "선행EPS": fwd_eps, "PEG": peg, "EPS추세(올해)": eps_trend_str,
+                        "투자의견": rec, "상승여력": upside
                     })
-                    
                 except Exception as e: continue
-            
             bar.empty()
-            
             if f_res:
                 df_fin = pd.DataFrame(f_res)
                 st.success(f"✅ 총 {len(df_fin)}개 기업 재무/EPS 분석 완료")
                 st.dataframe(df_fin, use_container_width=True)
+            else: st.warning("데이터를 가져오지 못했습니다.")
+
+# [NEW] 4. 엑셀 데이터 매칭 탭 (전면 수정)
+with tab4:
+    st.markdown("### 📂 엑셀 데이터 매칭 (퀀티와이즈 연동)")
+    st.info("퀀티와이즈에서 추출한 엑셀 파일(quant_master.xlsx)을 업로드하여 EPS 변화율을 매칭합니다.")
+    
+    # 1. 파일 업로드
+    uploaded_file = st.file_uploader("📥 quant_master.xlsx 파일을 드래그하여 업로드하세요", type=['xlsx'])
+    
+    # 2. 분석할 타겟 선택 (옵션)
+    target_source = st.radio("분석할 종목 리스트 출처:", ["구글 시트 전체 종목", "DB에 저장된 종목(관심종목)"], horizontal=True)
+    
+    if uploaded_file and st.button("🔄 매칭 및 분석 시작"):
+        # 1. 엑셀 읽기
+        try:
+            # 시트별 데이터 읽기 (1w, 1m, 3m 시트가 있다고 가정)
+            df_1w = pd.read_excel(uploaded_file, sheet_name='1w')
+            df_1m = pd.read_excel(uploaded_file, sheet_name='1m')
+            df_3m = pd.read_excel(uploaded_file, sheet_name='3m')
+            
+            # 딕셔너리로 변환 (검색 속도 향상)
+            # A열: 티커, D열: 변화율 (Col Index 0, 3)
+            # 티커 정규화 함수: 4082-JP -> 4082, AAPL-US -> AAPL
+            def normalize_qt_ticker(t):
+                return str(t).split('-')[0].strip()
+            
+            # 매칭용 딕셔너리 생성 함수
+            def create_lookup_dict(df):
+                lookup = {}
+                for idx, row in df.iterrows():
+                    raw_ticker = row.iloc[0] # A열
+                    val = row.iloc[3]        # D열 (변화율)
+                    norm_ticker = normalize_qt_ticker(raw_ticker)
+                    lookup[norm_ticker] = val
+                return lookup
+            
+            dict_1w = create_lookup_dict(df_1w)
+            dict_1m = create_lookup_dict(df_1m)
+            dict_3m = create_lookup_dict(df_3m)
+            
+            st.success("✅ 엑셀 데이터 로드 완료! (1w, 1m, 3m)")
+            
+        except Exception as e:
+            st.error(f"엑셀 읽기 실패: {e} (시트명 1w, 1m, 3m 확인 필요)")
+            st.stop()
+            
+        # 2. 타겟 종목 가져오기
+        if "DB" in target_source:
+            targets = get_unique_tickers_from_db()
+        else:
+            targets = get_tickers_from_sheet()
+            
+        if not targets:
+            st.warning("분석할 종목이 없습니다.")
+            st.stop()
+            
+        # 3. 매칭 로직
+        matched_results = []
+        progress = st.progress(0)
+        
+        for i, t in enumerate(targets):
+            progress.progress((i + 1) / len(targets))
+            
+            # 앱 티커 정규화 (4082.T -> 4082, AAPL -> AAPL)
+            if '.' in t:
+                # 예: 005930.KS -> 005930, 4082.T -> 4082
+                # 예외: BRK.B -> BRK.B (미국 주식 중 점 있는 경우.. 보통 엑셀엔 BRK/B 등으로 있을 수 있음. 일단 점 앞만)
+                # 한국/일본 등은 점 앞이 코드. 미국은 점 없거나 점 유지.
+                # 안전하게 숫자형 티커면 점 앞을, 문자형이면 그대로 두거나 점 앞을 시도
+                if t[0].isdigit(): # 005930.KS
+                    search_key = t.split('.')[0]
+                else: # AAPL
+                    search_key = t # AAPL-US -> AAPL 매칭
             else:
-                st.warning("데이터를 가져오지 못했습니다.")
+                search_key = t
+                
+            # 데이터 찾기
+            val_1w = dict_1w.get(search_key, "-")
+            val_1m = dict_1m.get(search_key, "-")
+            val_3m = dict_3m.get(search_key, "-")
+            
+            # 결과 저장 (하나라도 있으면 표시)
+            if val_1w != "-" or val_1m != "-" or val_3m != "-":
+                matched_results.append({
+                    "종목코드": t,
+                    "매칭키": search_key, # 확인용
+                    "1주 변화(1W)": val_1w,
+                    "1개월 변화(1M)": val_1m,
+                    "3개월 변화(3M)": val_3m
+                })
+        
+        progress.empty()
+        
+        # 4. 결과 표시
+        if matched_results:
+            df_match = pd.DataFrame(matched_results)
+            st.success(f"✅ 총 {len(df_match)}개 종목 매칭 성공!")
+            
+            # 서식 적용 (퍼센트 등은 엑셀 원본 따라감, 여기선 문자열/숫자 그대로 표시)
+            st.dataframe(df_match, use_container_width=True)
+        else:
+            st.warning("매칭된 데이터가 없습니다. (티커 형식을 확인해주세요)")
 
 st.markdown("---")
 with st.expander("🗄️ 전체 저장 기록 보기 / 관리"):

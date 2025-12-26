@@ -197,27 +197,25 @@ def save_to_supabase(data_list, strategy_name):
         st.error(f"DB 저장 실패: {e}")
 
 # ==========================================
-# [NEW] Supabase에서 최신 Quant 데이터 불러오기
+# [중요 수정] Supabase 데이터 로드 및 티커 매칭 로직
 # ==========================================
-@st.cache_data(ttl=600) # 10분 캐싱
+@st.cache_data(ttl=600) 
 def fetch_latest_quant_data_from_db():
     """DB에서 가장 최신의 EPS 데이터를 가져와 딕셔너리로 반환"""
     if not supabase: return {}
     try:
-        # 모든 데이터 가져오기 (created_at 내림차순)
         response = supabase.table("quant_data").select("*").order("created_at", desc=True).execute()
         if not response.data: return {}
         
-        # Pandas로 변환하여 중복 제거 (최신 1개만 유지)
         df = pd.DataFrame(response.data)
         if df.empty: return {}
         
-        # ticker 기준 중복 제거 (정렬되어 있으므로 첫 번째가 최신)
+        # ticker 기준 최신 1개만 유지 (중복 제거)
         df_latest = df.drop_duplicates(subset='ticker', keep='first')
         
-        # 딕셔너리 변환 { 'AAPL': {'1w':.., '1m':..}, ... }
         result_dict = {}
         for _, row in df_latest.iterrows():
+            # DB에 저장된 티커 키로 저장 (이미 정규화되어 있음: 005930, AAPL)
             result_dict[row['ticker']] = {
                 '1w': row.get('change_1w', '-'),
                 '1m': row.get('change_1m', '-'),
@@ -225,22 +223,49 @@ def fetch_latest_quant_data_from_db():
             }
         return result_dict
     except Exception as e:
-        # st.error(f"DB 데이터 로드 실패: {e}")
         return {}
 
-def normalize_qt_ticker(t):
+def normalize_ticker_for_lookup(t):
+    """
+    조회용 티커 정규화 함수 (DB 키와 맞추기 위함)
+    입력: '005930.KS', 'AAPL', '4082.T' 
+    출력: '005930', 'AAPL', '4082' (점이나 하이픈 뒤 제거)
+    """
     if not t: return ""
     t_str = str(t).upper().strip()
-    if '-' in t_str: return t_str.split('-')[0]
-    if '.' in t_str: return t_str.split('.')[0]
+    
+    # 1. 하이픈(-) 제거 (퀀티와이즈 스타일 대응)
+    if '-' in t_str: 
+        return t_str.split('-')[0]
+    
+    # 2. 점(.) 제거 (야후 파이낸스 스타일 대응)
+    # 단, 미국 주식 중 BRK.B 같은 경우는 예외가 필요할 수 있으나
+    # 보통 퀀티와이즈와 매칭하려면 점 앞이 코드인 경우가 많음 (아시아권)
+    # 안전하게: 숫자로 시작하면 무조건 점 앞을 자름 (한국, 일본, 홍콩 등)
+    if t_str[0].isdigit() and '.' in t_str:
+        return t_str.split('.')[0]
+    
+    # 문자로 시작하는데 점이 있는 경우 (BRK.B 등) -> 퀀티와이즈가 어떻게 저장됐느냐에 따라 다름
+    # 여기서는 일단 그대로 두거나 점 앞을 자르는 로직 중 하나 택일.
+    # 일반적으로 점 뒤를 자르는게 매칭 확률 높음.
+    if '.' in t_str:
+        return t_str.split('.')[0]
+        
     return t_str
 
 # 앱 시작 시 DB 데이터 로드 (캐시 사용)
 GLOBAL_QUANT_DATA = fetch_latest_quant_data_from_db()
 
 def get_eps_changes_from_db(ticker):
-    """메모리에 로드된 DB 데이터에서 찾기"""
-    norm_ticker = normalize_qt_ticker(ticker)
+    """
+    티커를 정규화하여 메모리에 로드된 DB 데이터에서 찾기
+    ticker: '005930.KS' -> normalize -> '005930' -> DB 검색
+    """
+    norm_ticker = normalize_ticker_for_lookup(ticker)
+    
+    # 디버깅용: 만약 데이터가 안 나오면 이 주석을 풀고 로그 확인
+    # print(f"Searching for: {ticker} -> {norm_ticker}") 
+    
     if norm_ticker in GLOBAL_QUANT_DATA:
         d = GLOBAL_QUANT_DATA[norm_ticker]
         return d['1w'], d['1m'], d['3m']
@@ -881,17 +906,19 @@ with tab4:
             
             # 매칭용 딕셔너리 생성
             quant_data = {}
-            def normalize_qt_ticker(t):
-                return str(t).split('-')[0].strip()
+            def normalize_ticker_db(t):
+                # 저장할 때 티커 정규화 (하이픈, 점 앞부분만 저장)
+                # ex: 4082-JP -> 4082, AAPL-US -> AAPL
+                return str(t).split('-')[0].split('.')[0].strip().upper()
             
             def merge_to_dict(df, key_name):
                 for idx, row in df.iterrows():
                     raw_ticker = row.iloc[0]
                     val = row.iloc[3]
-                    norm_ticker = normalize_qt_ticker(raw_ticker)
+                    norm_ticker = normalize_ticker_db(raw_ticker)
                     if norm_ticker not in quant_data:
                         quant_data[norm_ticker] = {'ticker': norm_ticker, '1w':None, '1m':None, '3m':None}
-                    quant_data[norm_ticker][key_name] = str(val) # DB 저장을 위해 문자열로
+                    quant_data[norm_ticker][key_name] = str(val)
             
             merge_to_dict(df_1w, '1w')
             merge_to_dict(df_1m, '1m')
@@ -908,12 +935,10 @@ with tab4:
                         "change_3m": v['3m']
                     })
                 
-                # 대량 Insert (배치 처리 가능하나, 일단 전체)
                 supabase.table("quant_data").insert(rows_to_insert).execute()
                 
-                # [중요] 캐시 초기화 (즉시 반영을 위해)
+                # [중요] 캐시 초기화 (즉시 반영)
                 fetch_latest_quant_data_from_db.clear()
-                # 전역 변수 갱신
                 GLOBAL_QUANT_DATA = fetch_latest_quant_data_from_db()
                 
                 st.success(f"✅ DB 업로드 완료! (총 {len(rows_to_insert)}개 데이터)")

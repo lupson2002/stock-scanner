@@ -6,7 +6,7 @@ from datetime import datetime
 from supabase import create_client, Client
 from scipy.signal import argrelextrema
 import time
-import re # 정규표현식 사용 (티커 매칭용)
+import re
 
 # =========================================================
 # [설정] Supabase 연결 정보
@@ -18,7 +18,7 @@ SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJ
 # 1. 페이지 설정 및 DB 연결
 # ==========================================
 st.set_page_config(page_title="Pro 주식 검색기", layout="wide")
-st.title("📈 Pro 주식 검색기: 섹터/국가/기술적/퀀티와이즈 통합")
+st.title("📈 Pro 주식 검색기: 섹터/국가/기술적/퀀티와이즈 DB 통합")
 
 @st.cache_resource
 def init_supabase():
@@ -196,6 +196,55 @@ def save_to_supabase(data_list, strategy_name):
     except Exception as e:
         st.error(f"DB 저장 실패: {e}")
 
+# [NEW] Supabase에서 최신 Quant 데이터 불러오기 (캐싱)
+@st.cache_data(ttl=600) # 10분 캐싱
+def fetch_latest_quant_data_from_db():
+    """DB에서 가장 최신의 EPS 데이터를 가져와 딕셔너리로 반환"""
+    if not supabase: return {}
+    try:
+        # 모든 데이터 가져오기 (created_at 내림차순)
+        # 데이터가 많아지면 limit을 걸거나 날짜 필터링 필요
+        response = supabase.table("quant_data").select("*").order("created_at", desc=True).execute()
+        if not response.data: return {}
+        
+        # Pandas로 변환하여 중복 제거 (최신 1개만 유지)
+        df = pd.DataFrame(response.data)
+        if df.empty: return {}
+        
+        # ticker 기준 중복 제거 (정렬되어 있으므로 첫 번째가 최신)
+        df_latest = df.drop_duplicates(subset='ticker', keep='first')
+        
+        # 딕셔너리 변환 { 'AAPL': {'1w':.., '1m':..}, ... }
+        result_dict = {}
+        for _, row in df_latest.iterrows():
+            result_dict[row['ticker']] = {
+                '1w': row.get('change_1w', '-'),
+                '1m': row.get('change_1m', '-'),
+                '3m': row.get('change_3m', '-')
+            }
+        return result_dict
+    except Exception as e:
+        st.error(f"DB 데이터 로드 실패: {e}")
+        return {}
+
+def normalize_qt_ticker(t):
+    if not t: return ""
+    t_str = str(t).upper().strip()
+    if '-' in t_str: return t_str.split('-')[0]
+    if '.' in t_str: return t_str.split('.')[0]
+    return t_str
+
+# 전역 변수로 DB 데이터 로드 (앱 실행 시 1회)
+GLOBAL_QUANT_DATA = fetch_latest_quant_data_from_db()
+
+def get_eps_changes_from_db(ticker):
+    """메모리에 로드된 DB 데이터에서 찾기"""
+    norm_ticker = normalize_qt_ticker(ticker)
+    if norm_ticker in GLOBAL_QUANT_DATA:
+        d = GLOBAL_QUANT_DATA[norm_ticker]
+        return d['1w'], d['1m'], d['3m']
+    return "-", "-", "-"
+
 # ==========================================
 # 4. 분석 알고리즘 (지표 계산 & 패턴)
 # ==========================================
@@ -255,18 +304,12 @@ def calculate_common_indicators(df, is_weekly=False):
 def calculate_daily_indicators(df):
     if len(df) < 260: return None
     df = df.copy()
-    
-    # 1. BB (50일 EMA, 2시그마)
     df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['STD50'] = df['Close'].rolling(window=50).std()
     df['BB50_UP'] = df['EMA50'] + (2 * df['STD50'])
     df['BB50_LO'] = df['EMA50'] - (2 * df['STD50'])
     df['BW50'] = (df['BB50_UP'] - df['BB50_LO']) / df['EMA50']
-    
-    # 2. Donchian Channel (50일)
     df['Donchian_High_50'] = df['High'].rolling(window=50).max().shift(1)
-    
-    # 3. VR (50일)
     df['Change'] = df['Close'].diff()
     df['Vol_Up'] = np.where(df['Change'] > 0, df['Volume'], 0)
     df['Vol_Down'] = np.where(df['Change'] < 0, df['Volume'], 0)
@@ -275,41 +318,31 @@ def calculate_daily_indicators(df):
     roll_down = df['Vol_Down'].rolling(window=50).sum()
     roll_flat = df['Vol_Flat'].rolling(window=50).sum()
     df['VR50'] = ((roll_up + roll_flat/2) / (roll_down + roll_flat/2 + 1e-9)) * 100
-    
-    # 5. MACD Custom (20, 200, 20)
     ema_fast = df['Close'].ewm(span=20, adjust=False).mean()
     ema_slow = df['Close'].ewm(span=200, adjust=False).mean()
     df['MACD_Line_C'] = ema_fast - ema_slow
     df['MACD_Signal_C'] = df['MACD_Line_C'].ewm(span=20, adjust=False).mean()
     df['MACD_OSC_C'] = df['MACD_Line_C'] - df['MACD_Signal_C']
-    
-    # 6. ATR (14일)
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
     low_close = np.abs(df['Low'] - df['Close'].shift())
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR14'] = tr.ewm(span=14, adjust=False).mean()
-
     df['MACD_V'], _ = calculate_macdv(df, 12, 26, 9)
-
     return df
 
-# --- 분석 헬퍼 함수 ---
 def check_daily_condition(df):
     if len(df) < 260: return False, None
     df = calculate_daily_indicators(df)
     if df is None: return False, None
     curr = df.iloc[-1]
-    
     dc_cond = (df['Close'] > df['Donchian_High_50']).iloc[-3:].any()
     bb_cond = (df['Close'] > df['BB50_UP']).iloc[-3:].any()
     mandatory = dc_cond or bb_cond
-    
     vr_cond = (df['VR50'].iloc[-3:] > 110).any()
     bw_cond = (df['BW50'].iloc[-51] > curr['BW50']) if len(df)>55 else False
     macd_cond = curr['MACD_OSC_C'] > 0
     optional_count = sum([vr_cond, bw_cond, macd_cond])
-    
     if mandatory and (optional_count >= 2):
         squeeze = (df['BB50_UP'] < df['Donchian_High_50']).iloc[-5:].any()
         win_52 = df.iloc[-252:]
@@ -317,12 +350,7 @@ def check_daily_condition(df):
         prev_win = win_52[win_52.index < win_52['Close'].idxmax()]
         prev_date = prev_win['Close'].idxmax().strftime('%Y-%m-%d') if len(prev_win)>0 else "-"
         diff_days = (win_52['Close'].idxmax() - prev_win['Close'].idxmax()).days if len(prev_win)>0 else 0
-        
-        return True, {
-            'price': curr['Close'], 'atr': curr['ATR14'], 'high_date': high_52_date,
-            'prev_date': prev_date, 'diff_days': diff_days, 'bw_curr': curr['BW50'],
-            'macdv': curr['MACD_V'], 'squeeze': "🔥Squeeze" if squeeze else "-"
-        }
+        return True, {'price': curr['Close'], 'atr': curr['ATR14'], 'high_date': high_52_date, 'prev_date': prev_date, 'diff_days': diff_days, 'bw_curr': curr['BW50'], 'macdv': curr['MACD_V'], 'squeeze': "🔥Squeeze" if squeeze else "-"}
     return False, None
 
 def check_weekly_condition(df):
@@ -333,10 +361,7 @@ def check_weekly_condition(df):
     if curr['Close'] > curr['BB_UP']:
         bw_past = df['BandWidth'].iloc[-21]
         bw_change = "감소" if bw_past > curr['BandWidth'] else "증가"
-        return True, {
-            'price': curr['Close'], 'atr': curr['ATR14'], 'bw_curr': curr['BandWidth'],
-            'bw_past': bw_past, 'bw_change': bw_change, 'macdv': curr['MACD_V']
-        }
+        return True, {'price': curr['Close'], 'atr': curr['ATR14'], 'bw_curr': curr['BandWidth'], 'bw_past': bw_past, 'bw_change': bw_change, 'macdv': curr['MACD_V']}
     return False, None
 
 def check_monthly_condition(df):
@@ -346,15 +371,9 @@ def check_monthly_condition(df):
     if curr_price >= ath_price * 0.90:
         ath_idx = df['High'].idxmax()
         month_count = (df['Close'] >= ath_price * 0.90).sum()
-        return True, {
-            'price': curr_price, 'ath_price': ath_price,
-            'ath_date': ath_idx.strftime('%Y-%m'), 'month_count': month_count
-        }
+        return True, {'price': curr_price, 'ath_price': ath_price, 'ath_date': ath_idx.strftime('%Y-%m'), 'month_count': month_count}
     return False, None
 
-# ==========================================
-# 섹터/패턴 분석 함수
-# ==========================================
 def analyze_sector_trend():
     etfs = get_etfs_from_sheet()
     if not etfs: st.warning("ETF 목록 없음"); return []
@@ -364,7 +383,6 @@ def analyze_sector_trend():
     spy_c = spy_df['Close']
     spy_r1m = spy_c.pct_change(21).iloc[-1]; spy_r3m = spy_c.pct_change(63).iloc[-1]
     spy_r6m = spy_c.pct_change(126).iloc[-1]; spy_r12m = spy_c.pct_change(252).iloc[-1]
-    
     results = []; pbar = st.progress(0)
     for i, (t, n) in enumerate(etfs):
         pbar.progress((i+1)/len(etfs))
@@ -379,18 +397,15 @@ def analyze_sector_trend():
         tr = pd.concat([h-df['Low'], (h-c.shift()).abs(), (df['Low']-c.shift()).abs()], axis=1).max(axis=1)
         atr = tr.ewm(span=14).mean().iloc[-1]
         macdv, _ = calculate_macdv(df)
-        
         bb_bk = "O" if (c>bb_up).iloc[-3:].any() else "-"
         dc_bk = "O" if (c>dc_h).iloc[-3:].any() else "-"
         align = "⭐ 정배열" if (curr>ema20.iloc[-1] and curr>ema60.iloc[-1] and curr>ema100.iloc[-1] and curr>ema200.iloc[-1]) else "-"
         long_tr = "📈 상승" if (ema60.iloc[-1]>ema100.iloc[-1]>ema200.iloc[-1]) else "-"
-        
         r1 = c.pct_change(21).iloc[-1] if len(c)>21 else 0
         r3 = c.pct_change(63).iloc[-1] if len(c)>63 else 0
         r6 = c.pct_change(126).iloc[-1] if len(c)>126 else 0
         r12 = c.pct_change(252).iloc[-1] if len(c)>252 else 0
         score = (0.25*(r1-spy_r1m) + 0.25*(r3-spy_r3m) + 0.25*(r6-spy_r6m) + 0.25*(r12-spy_r12m))*100
-        
         results.append({"ETF":rt, "모멘텀점수":score, "BB(50,2)돌파":bb_bk, "돈키언(50)돌파":dc_bk, "정배열":align, "장기추세":long_tr, "MACD-V":f"{macdv.iloc[-1]:.2f}", "ATR":f"{atr:.2f}", "현재가":curr})
     pbar.empty()
     if results:
@@ -484,9 +499,11 @@ with tab1:
                 rt, df = smart_download(t, "1d", "2y")
                 passed, info = check_daily_condition(df)
                 if passed:
+                    eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
                     res.append({
                         '종목코드': rt, '국가/ETF명': n, '현재가': f"{info['price']:,.0f}",
                         'ATR(14)': f"{info['atr']:,.0f}", '스퀴즈': info['squeeze'],
+                        '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
                         '현52주신고가일': info['high_date'], '전52주신고가일': info['prev_date'],
                         '차이일': f"{info['diff_days']}일", 'BW현재': f"{info['bw_curr']:.4f}",
                         'MACD-V': f"{info['macdv']:.2f}", 'BW_Value': f"{info['bw_curr']:.4f}", 'MACD_V_Value': f"{info['macdv']:.2f}"
@@ -508,10 +525,12 @@ with tab1:
                 rt, df = smart_download(t, "1d", "2y")
                 passed, info = check_daily_condition(df)
                 if passed:
+                    eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
                     sector = get_stock_sector(rt)
                     res.append({
                         '종목코드': rt, '섹터': sector, '현재가': f"{info['price']:,.0f}",
                         'ATR(14)': f"{info['atr']:,.0f}", '스퀴즈': info['squeeze'],
+                        '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
                         '현52주신고가일': info['high_date'], '전52주신고가일': info['prev_date'],
                         '차이일': f"{info['diff_days']}일", 'BW현재': f"{info['bw_curr']:.4f}",
                         'MACD-V': f"{info['macdv']:.2f}", 'BW_Value': f"{info['bw_curr']:.4f}", 'MACD_V_Value': f"{info['macdv']:.2f}"
@@ -533,10 +552,12 @@ with tab1:
                 rt, df = smart_download(t, "1wk", "2y")
                 passed, info = check_weekly_condition(df)
                 if passed:
+                    eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
                     sector = get_stock_sector(rt)
                     res.append({
                         '종목코드': rt, '섹터': sector, '현재가': f"{info['price']:,.0f}",
                         'ATR(14주)': f"{info['atr']:,.0f}", 'BW현재': f"{info['bw_curr']:.4f}",
+                        '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
                         'BW(20주전)': f"{info['bw_past']:.4f}", 'BW변화': info['bw_change'],
                         'MACD-V': f"{info['macdv']:.2f}", 'BW_Value': f"{info['bw_curr']:.4f}", 'MACD_V_Value': f"{info['macdv']:.2f}"
                     })
@@ -557,10 +578,12 @@ with tab1:
                 rt, df = smart_download(t, "1mo", "max")
                 passed, info = check_monthly_condition(df)
                 if passed:
+                    eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
                     sector = get_stock_sector(rt)
                     res.append({
                         '종목코드': rt, '섹터': sector, '현재가': f"{info['price']:,.0f}",
                         'ATH최고가': f"{info['ath_price']:,.0f}", 'ATH달성월': info['ath_date'],
+                        '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
                         '고권역(월수)': f"{info['month_count']}개월",
                         '현52주신고가일': info['ath_date'], 'BW_Value': str(info['month_count']), 'MACD_V_Value': "0"
                     })
@@ -585,9 +608,11 @@ with tab1:
                 pass_m, info_m = check_monthly_condition(df_m)
                 if not pass_m: continue
                 sector = get_stock_sector(rt)
+                eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
                 res.append({
                     '종목코드': rt, '섹터': sector, '현재가': f"{info_d['price']:,.0f}",
                     '스퀴즈': info_d['squeeze'], 'ATH달성월': info_m['ath_date'],
+                    '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
                     '고권역(월수)': f"{info_m['month_count']}개월",
                     '현52주신고가일': info_d['high_date'], '전52주신고가일': info_d['prev_date'],
                     '차이일': f"{info_d['diff_days']}일", 'BW_Value': str(info_m['month_count']), 'MACD_V_Value': f"{info_d['macdv']:.2f}"
@@ -613,9 +638,11 @@ with tab1:
                 pass_w, info_w = check_weekly_condition(df_w)
                 if not pass_w: continue
                 sector = get_stock_sector(rt)
+                eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
                 res.append({
                     '종목코드': rt, '섹터': sector, '현재가': f"{info_d['price']:,.0f}",
                     '스퀴즈': info_d['squeeze'], '주봉BW': f"{info_w['bw_curr']:.4f}", '주봉BW변화': info_w['bw_change'],
+                    '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
                     '현52주신고가일': info_d['high_date'], '전52주신고가일': info_d['prev_date'],
                     '차이일': f"{info_d['diff_days']}일", 'BW_Value': f"{info_w['bw_curr']:.4f}", 'MACD_V_Value': f"{info_d['macdv']:.2f}"
                 })
@@ -640,9 +667,11 @@ with tab1:
                 pass_m, info_m = check_monthly_condition(df_m)
                 if not pass_m: continue
                 sector = get_stock_sector(rt)
+                eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
                 res.append({
                     '종목코드': rt, '섹터': sector, '현재가': f"{info_w['price']:,.0f}",
                     '주봉BW': f"{info_w['bw_curr']:.4f}", '주봉BW변화': info_w['bw_change'],
+                    '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
                     'ATH달성월': info_m['ath_date'], '고권역(월수)': f"{info_m['month_count']}개월",
                     '현52주신고가일': info_m['ath_date'], 'BW_Value': f"{info_w['bw_curr']:.4f}", 'MACD_V_Value': f"{info_w['macdv']:.2f}"
                 })
@@ -670,10 +699,12 @@ with tab1:
                 pass_m, info_m = check_monthly_condition(df_m)
                 if not pass_m: continue
                 sector = get_stock_sector(rt)
+                eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
                 res.append({
                     '종목코드': rt, '섹터': sector, '현재가': f"{info_d['price']:,.0f}",
                     'ATH최고가': f"{info_m['ath_price']:,.0f}", 'ATH달성월': info_m['ath_date'],
                     '해당월수': f"{info_m['month_count']}개월", '스퀴즈': info_d['squeeze'],
+                    '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
                     '현52주신고가일': info_d['high_date'], '전52주신고가일': info_d['prev_date'],
                     '차이일': f"{info_d['diff_days']}일", '주봉BW': f"{info_w['bw_curr']:.4f}",
                     '주봉BW변화': info_w['bw_change'], 'MACD-V': f"{info_w['macdv']:.2f}",
@@ -699,9 +730,11 @@ with tab1:
                     df = calculate_common_indicators(df, True)
                     curr = df.iloc[-1]
                     sector = get_stock_sector(rt)
+                    eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
                     res.append({
                         '종목코드': rt, '섹터': sector, '현재가': f"{curr['Close']:,.0f}",
                         '패턴상세': f"깊이:{info['depth']}", '돌파가격': info['pivot'],
+                        '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
                         'BW_Value': f"{curr['BandWidth']:.4f}", 'MACD_V_Value': f"{curr['MACD_V']:.2f}"
                     })
             bar.empty()
@@ -724,9 +757,11 @@ with tab1:
                     df = calculate_common_indicators(df, True)
                     curr = df.iloc[-1]
                     sector = get_stock_sector(rt)
+                    eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
                     res.append({
                         '종목코드': rt, '섹터': sector, '현재가': f"{curr['Close']:,.0f}",
                         '넥라인': info['Neckline'], '거래량급증': info['Vol_Ratio'],
+                        '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
                         'BW_Value': f"{curr['BandWidth']:.4f}", 'MACD_V_Value': f"{curr['MACD_V']:.2f}"
                     })
             bar.empty()
@@ -759,8 +794,10 @@ with tab2:
                     if (curr['Close'] > curr['EMA200']) and (-100 <= curr['MACD_V'] <= -50):
                          cond = "🧲 MACD-V 과매도"
                     if cond:
+                        eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
                         res.append({
                             '종목코드': rt, '패턴': cond, '현재가': f"{curr['Close']:,.0f}",
+                            '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
                             'MACD-V': f"{curr['MACD_V']:.2f}", 'EMA20': f"{ema20:,.0f}"
                         })
                 except: continue
@@ -809,10 +846,14 @@ with tab3:
                     target = info.get('targetMeanPrice')
                     curr_p = info.get('currentPrice', 0)
                     upside = f"{(target - curr_p) / curr_p * 100:.1f}%" if (target and curr_p) else "-"
+                    
+                    eps1w, eps1m, eps3m = get_eps_changes_from_db(real_ticker)
+                    
                     f_res.append({
                         "종목": real_ticker, "섹터": info.get('sector', '-'), "산업": info.get('industry', '-'),
                         "시가총액": mkt_cap_str, "매출성장(YoY)": rev_str, "EPS성장(YoY)": eps_growth_str,
                         "선행EPS": fwd_eps, "PEG": peg, "EPS추세(올해)": eps_trend_str,
+                        "1W변화": eps1w, "1M변화": eps1m, "3M변화": eps3m,
                         "투자의견": rec, "상승여력": upside
                     })
                 except Exception as e: continue
@@ -823,107 +864,59 @@ with tab3:
                 st.dataframe(df_fin, use_container_width=True)
             else: st.warning("데이터를 가져오지 못했습니다.")
 
-# [NEW] 4. 엑셀 데이터 매칭 탭 (전면 수정)
+# [NEW] 4. 엑셀 데이터 매칭 탭 (DB 저장)
 with tab4:
-    st.markdown("### 📂 엑셀 데이터 매칭 (퀀티와이즈 연동)")
-    st.info("퀀티와이즈에서 추출한 엑셀 파일(quant_master.xlsx)을 업로드하여 EPS 변화율을 매칭합니다.")
+    st.markdown("### 📂 엑셀 데이터 매칭 (퀀티와이즈 DB 연동)")
+    st.info("퀀티와이즈에서 추출한 엑셀 파일(quant_master.xlsx)을 업로드하여 Supabase DB에 저장합니다.")
     
-    # 1. 파일 업로드
     uploaded_file = st.file_uploader("📥 quant_master.xlsx 파일을 드래그하여 업로드하세요", type=['xlsx'])
     
-    # 2. 분석할 타겟 선택 (옵션)
-    target_source = st.radio("분석할 종목 리스트 출처:", ["구글 시트 전체 종목", "DB에 저장된 종목(관심종목)"], horizontal=True)
-    
-    if uploaded_file and st.button("🔄 매칭 및 분석 시작"):
-        # 1. 엑셀 읽기
+    if uploaded_file and st.button("🔄 DB 업로드 및 분석 시작"):
         try:
-            # 시트별 데이터 읽기 (1w, 1m, 3m 시트가 있다고 가정)
+            # 엑셀 읽기
             df_1w = pd.read_excel(uploaded_file, sheet_name='1w')
             df_1m = pd.read_excel(uploaded_file, sheet_name='1m')
             df_3m = pd.read_excel(uploaded_file, sheet_name='3m')
             
-            # 딕셔너리로 변환 (검색 속도 향상)
-            # A열: 티커, D열: 변화율 (Col Index 0, 3)
-            # 티커 정규화 함수: 4082-JP -> 4082, AAPL-US -> AAPL
+            # 매칭용 딕셔너리 생성
+            quant_data = {}
             def normalize_qt_ticker(t):
                 return str(t).split('-')[0].strip()
             
-            # 매칭용 딕셔너리 생성 함수
-            def create_lookup_dict(df):
-                lookup = {}
+            def merge_to_dict(df, key_name):
                 for idx, row in df.iterrows():
-                    raw_ticker = row.iloc[0] # A열
-                    val = row.iloc[3]        # D열 (변화율)
+                    raw_ticker = row.iloc[0]
+                    val = row.iloc[3]
                     norm_ticker = normalize_qt_ticker(raw_ticker)
-                    lookup[norm_ticker] = val
-                return lookup
+                    if norm_ticker not in quant_data:
+                        quant_data[norm_ticker] = {'ticker': norm_ticker, '1w':None, '1m':None, '3m':None}
+                    quant_data[norm_ticker][key_name] = str(val) # DB 저장을 위해 문자열로
             
-            dict_1w = create_lookup_dict(df_1w)
-            dict_1m = create_lookup_dict(df_1m)
-            dict_3m = create_lookup_dict(df_3m)
+            merge_to_dict(df_1w, '1w')
+            merge_to_dict(df_1m, '1m')
+            merge_to_dict(df_3m, '3m')
             
-            st.success("✅ 엑셀 데이터 로드 완료! (1w, 1m, 3m)")
-            
-        except Exception as e:
-            st.error(f"엑셀 읽기 실패: {e} (시트명 1w, 1m, 3m 확인 필요)")
-            st.stop()
-            
-        # 2. 타겟 종목 가져오기
-        if "DB" in target_source:
-            targets = get_unique_tickers_from_db()
-        else:
-            targets = get_tickers_from_sheet()
-            
-        if not targets:
-            st.warning("분석할 종목이 없습니다.")
-            st.stop()
-            
-        # 3. 매칭 로직
-        matched_results = []
-        progress = st.progress(0)
-        
-        for i, t in enumerate(targets):
-            progress.progress((i + 1) / len(targets))
-            
-            # 앱 티커 정규화 (4082.T -> 4082, AAPL -> AAPL)
-            if '.' in t:
-                # 예: 005930.KS -> 005930, 4082.T -> 4082
-                # 예외: BRK.B -> BRK.B (미국 주식 중 점 있는 경우.. 보통 엑셀엔 BRK/B 등으로 있을 수 있음. 일단 점 앞만)
-                # 한국/일본 등은 점 앞이 코드. 미국은 점 없거나 점 유지.
-                # 안전하게 숫자형 티커면 점 앞을, 문자형이면 그대로 두거나 점 앞을 시도
-                if t[0].isdigit(): # 005930.KS
-                    search_key = t.split('.')[0]
-                else: # AAPL
-                    search_key = t # AAPL-US -> AAPL 매칭
-            else:
-                search_key = t
+            # DB에 저장
+            if quant_data:
+                rows_to_insert = []
+                for t, v in quant_data.items():
+                    rows_to_insert.append({
+                        "ticker": t,
+                        "change_1w": v['1w'],
+                        "change_1m": v['1m'],
+                        "change_3m": v['3m']
+                    })
                 
-            # 데이터 찾기
-            val_1w = dict_1w.get(search_key, "-")
-            val_1m = dict_1m.get(search_key, "-")
-            val_3m = dict_3m.get(search_key, "-")
-            
-            # 결과 저장 (하나라도 있으면 표시)
-            if val_1w != "-" or val_1m != "-" or val_3m != "-":
-                matched_results.append({
-                    "종목코드": t,
-                    "매칭키": search_key, # 확인용
-                    "1주 변화(1W)": val_1w,
-                    "1개월 변화(1M)": val_1m,
-                    "3개월 변화(3M)": val_3m
-                })
-        
-        progress.empty()
-        
-        # 4. 결과 표시
-        if matched_results:
-            df_match = pd.DataFrame(matched_results)
-            st.success(f"✅ 총 {len(df_match)}개 종목 매칭 성공!")
-            
-            # 서식 적용 (퍼센트 등은 엑셀 원본 따라감, 여기선 문자열/숫자 그대로 표시)
-            st.dataframe(df_match, use_container_width=True)
-        else:
-            st.warning("매칭된 데이터가 없습니다. (티커 형식을 확인해주세요)")
+                # 대량 Insert (배치 처리 가능하나, 일단 전체)
+                # 기존 데이터 중복 방지를 위해 날짜별 관리가 필요하나, 여기선 append
+                # *실제 운영 시에는 당일 중복 제거 로직 필요 가능
+                supabase.table("quant_data").insert(rows_to_insert).execute()
+                
+                st.success(f"✅ DB 업로드 완료! (총 {len(rows_to_insert)}개 데이터)")
+                st.info("이제 다른 탭에서 분석 시, 이 데이터가 자동으로 표시됩니다.")
+                
+        except Exception as e:
+            st.error(f"작업 실패: {e}")
 
 st.markdown("---")
 with st.expander("🗄️ 전체 저장 기록 보기 / 관리"):

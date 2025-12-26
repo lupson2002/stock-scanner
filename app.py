@@ -105,7 +105,6 @@ def get_unique_tickers_from_db():
 def remove_duplicates_from_db():
     if not supabase: return
     try:
-        # history 테이블 중복 제거
         response = supabase.table("history").select("id, ticker, created_at").order("created_at", desc=True).execute()
         data = response.data
         if not data:
@@ -135,7 +134,6 @@ def smart_download(ticker, interval="1d", period="2y"):
     if ':' in ticker: ticker = ticker.split(':')[-1]
     ticker = ticker.replace('/', '-')
     candidates = [ticker]
-    # 숫자 6자리인 경우 한국 주식으로 가정
     if ticker.isdigit() and len(ticker) == 6:
         candidates = [f"{ticker}.KS", f"{ticker}.KQ", ticker]
     
@@ -212,7 +210,7 @@ def normalize_ticker_for_db_storage(t):
     # 1. 미국 주식 (-US)
     if t_str.endswith("-US"):
         clean = t_str[:-3]  # -US 제거
-        # 점(.)을 하이픈(-)으로 변경 (본주/우선주 충돌 방지)
+        # 본주/우선주 충돌 방지를 위해 점(.)을 하이픈(-)으로 변경
         return clean.replace('.', '-')
 
     # 2. 홍콩 (-HK)
@@ -242,24 +240,24 @@ def normalize_ticker_for_app_lookup(t):
     if not t: return ""
     t_str = str(t).upper().strip()
     
-    # 1. 한국 주식 (.KS, .KQ) -> DB에는 숫자만 저장되어 있으므로 제거
+    # 한국 주식 (.KS, .KQ 제거)
     if t_str.endswith(".KS"): return t_str[:-3]
     if t_str.endswith(".KQ"): return t_str[:-3]
     
-    # 2. 미국 주식 (. -> -)
+    # 미국 주식 (. -> -)
     if '.' in t_str and not any(x in t_str for x in ['.HK', '.T', '.KS', '.KQ']):
         return t_str.replace('.', '-')
         
     return t_str
 
 # ==========================================
-# [중요] DB 데이터 로드 (캐시)
+# [중요] DB 데이터 로드 (캐시) - TEXT 타입 대응
 # ==========================================
 @st.cache_data(ttl=600) 
 def fetch_latest_quant_data_from_db():
     if not supabase: return {}
     try:
-        # 최신순 정렬 (데이터는 이제 text 타입입니다)
+        # 최신순 정렬 (데이터는 이제 문자열입니다)
         response = supabase.table("quant_data").select("*").order("created_at", desc=True).execute()
         if not response.data: return {}
         
@@ -272,6 +270,7 @@ def fetch_latest_quant_data_from_db():
         result_dict = {}
         for _, row in df_latest.iterrows():
             result_dict[row['ticker']] = {
+                # 가져올 때 None이면 "-"로 처리
                 '1w': str(row.get('change_1w') or "-"),
                 '1m': str(row.get('change_1m') or "-"),
                 '3m': str(row.get('change_3m') or "-")
@@ -285,14 +284,13 @@ GLOBAL_QUANT_DATA = fetch_latest_quant_data_from_db()
 
 def get_eps_changes_from_db(ticker):
     norm_ticker = normalize_ticker_for_app_lookup(ticker)
-    
     if norm_ticker in GLOBAL_QUANT_DATA:
         d = GLOBAL_QUANT_DATA[norm_ticker]
         return d['1w'], d['1m'], d['3m']
     return "-", "-", "-"
 
 # ==========================================
-# 4. 분석 알고리즘 (지표 계산 & 패턴)
+# 4. 분석 알고리즘 (생략된 부분 없음)
 # ==========================================
 
 def find_extrema(df, order=3):
@@ -916,11 +914,10 @@ with tab3:
 with tab4:
     st.markdown("### 📂 엑셀 데이터 매칭 (퀀티와이즈 DB 연동)")
     st.info("퀀티와이즈 엑셀(quant_master.xlsx)을 업로드하여 Supabase DB에 저장합니다.\n\n"
+            "**[주의사항]**\n"
+            "- Supabase DB의 `quant_data` 테이블 컬럼이 **TEXT** 타입이어야 합니다.\n"
             "**[화이트리스트 적용]**\n"
-            "- 구글 시트(TGT)에 있는 종목만 필터링하여 저장합니다. (나머지는 버림)\n"
-            "**[규칙]**\n"
-            "- 미국 주식: 점(.) -> 하이픈(-), 접미사(-US) 제거\n"
-            "- 한국 주식: 숫자만 저장 (접미사 -KS 제거)")
+            "- 구글 시트(TGT)에 있는 종목만 필터링하여 저장합니다.\n")
     
     col_upload, col_reset = st.columns([3, 1])
     
@@ -962,7 +959,8 @@ with tab4:
                     final_val = "-"
                 else:
                     final_val = str(val).strip()
-                    if final_val == "":
+                    # 문자열 "nan" 또는 빈 값 처리
+                    if final_val.lower() == 'nan' or final_val == "":
                         final_val = "-"
                 
                 extracted[norm_ticker] = final_val
@@ -990,8 +988,8 @@ with tab4:
             
             st.success(f"관리 대상 종목 {len(allowed_db_tickers)}개를 확인했습니다. 필터링을 시작합니다.")
 
-            # 1. 엑셀 파일 읽기
-            xls = pd.read_excel(uploaded_file, sheet_name=None, header=None)
+            # 1. 엑셀 파일 읽기 (모든 데이터를 문자열로 읽기)
+            xls = pd.read_excel(uploaded_file, sheet_name=None, header=None, dtype=str)
             
             sheet_map = {'1w': None, '1m': None, '3m': None}
             for sheet_name in xls.keys():

@@ -141,7 +141,6 @@ def smart_download(ticker, interval="1d", period="2y"):
     
     for t in candidates:
         try:
-            # 여러 번 시도
             for _ in range(3):
                 df = yf.download(t, period=period, interval=interval, progress=False, auto_adjust=False)
                 if len(df) > 0:
@@ -200,27 +199,70 @@ def save_to_supabase(data_list, strategy_name):
     except Exception as e:
         st.error(f"DB 저장 실패: {e}")
 
+# ==============================================================================
+# [핵심 변경] 티커 정규화 로직 개선 (야후 파이낸스 호환)
+# ==============================================================================
+def normalize_ticker_standard(t):
+    """
+    퀀티와이즈(Excel) 티커를 야후 파이낸스/DB 키 형식으로 변환합니다.
+    - COF-US -> COF (본주)
+    - COF.PRK-US -> COF-PRK (우선주 충돌 방지)
+    - HEI.A-US -> HEI-A (Class A 충돌 방지)
+    - 005930-KS -> 005930.KS (한국 주식 유지)
+    """
+    if not t: return ""
+    t_str = str(t).upper().strip()
+    
+    # 1. 국가 코드 처리
+    # 미국 주식(-US)인 경우: 하이픈 제거 + 점(.)을 하이픈(-)으로 변경
+    if t_str.endswith("-US"):
+        # "-US" 제거
+        clean_ticker = t_str[:-3]
+        # 야후 호환: 미국 주식은 점(.) 대신 하이픈(-) 사용 (BRK.B -> BRK-B)
+        clean_ticker = clean_ticker.replace('.', '-')
+        return clean_ticker
+
+    # 한국 주식(-KS, -KQ)인 경우: 야후 포맷인 .KS, .KQ로 변경
+    if t_str.endswith("-KS"):
+        return t_str[:-3] + ".KS"
+    if t_str.endswith("-KQ"):
+        return t_str[:-3] + ".KQ"
+        
+    # 홍콩(-HK) -> .HK
+    if t_str.endswith("-HK"):
+        # 4자리 숫자일 경우 앞의 0 제거 여부는 야후 정책 따름 (보통 0005.HK)
+        return t_str[:-3] + ".HK"
+        
+    # 일본(-JP) -> .T
+    if t_str.endswith("-JP"):
+        return t_str[:-3] + ".T"
+    
+    # 기타: 하이픈이 있으면 일단 앞부분만 가져오되, 점 처리 주의
+    if '-' in t_str:
+        return t_str.split('-')[0]
+        
+    return t_str
+
 # ==========================================
-# [중요 수정] Supabase 데이터 로드 및 티커 매칭 로직
+# [중요] DB 데이터 로드 (수정된 정규화 적용)
 # ==========================================
 @st.cache_data(ttl=600) 
 def fetch_latest_quant_data_from_db():
-    """DB에서 가장 최신의 EPS 데이터를 가져와 딕셔너리로 반환"""
+    """DB에서 1W, 1M, 3M 변화율을 가져옵니다."""
     if not supabase: return {}
     try:
-        # created_at 내림차순 정렬하여 최신 데이터가 위로 오게 함
+        # 최신순 정렬
         response = supabase.table("quant_data").select("*").order("created_at", desc=True).execute()
         if not response.data: return {}
         
         df = pd.DataFrame(response.data)
         if df.empty: return {}
         
-        # ticker 기준 최신 1개만 유지 (중복 제거 - DB 쿼리 결과 순서 의존)
+        # 티커 중복 제거 (가장 최신 데이터 1개만 남김)
         df_latest = df.drop_duplicates(subset='ticker', keep='first')
         
         result_dict = {}
         for _, row in df_latest.iterrows():
-            # DB에 저장된 티커 키로 저장 (이미 정규화되어 있음: 005930, AAPL)
             result_dict[row['ticker']] = {
                 '1w': row.get('change_1w', '-'),
                 '1m': row.get('change_1m', '-'),
@@ -230,36 +272,22 @@ def fetch_latest_quant_data_from_db():
     except Exception as e:
         return {}
 
-def normalize_ticker_for_lookup(t):
-    """
-    조회용 티커 정규화 함수 (DB 키와 맞추기 위함)
-    입력: '005930.KS', 'AAPL', '4082.T', 'COF-US' 
-    출력: '005930', 'AAPL', '4082', 'COF' (점이나 하이픈 뒤 제거)
-    """
-    if not t: return ""
-    t_str = str(t).upper().strip()
-    
-    # 1. 하이픈(-) 제거 (퀀티와이즈 스타일 대응: COF-US -> COF)
-    if '-' in t_str: 
-        return t_str.split('-')[0]
-    
-    # 2. 점(.) 제거
-    # 숫자로 시작(아시아 등) 또는 문자여도 BRK.B 등을 제외하고는 보통 앞부분이 핵심
-    if '.' in t_str:
-        return t_str.split('.')[0]
-        
-    return t_str
-
-# 앱 시작 시 DB 데이터 로드 (캐시 사용)
+# 앱 시작 시 DB 데이터 로드
 GLOBAL_QUANT_DATA = fetch_latest_quant_data_from_db()
 
 def get_eps_changes_from_db(ticker):
     """
-    티커를 정규화하여 메모리에 로드된 DB 데이터에서 찾기
-    ticker: '005930.KS' -> normalize -> '005930' -> DB 검색
+    앱 내 분석 시 티커를 표준화하여 DB에서 검색
     """
-    norm_ticker = normalize_ticker_for_lookup(ticker)
+    # 분석 시 사용하는 티커(예: AAPL)를 표준 포맷으로 변환 (AAPL)
+    # 이미 야후 포맷이라면 그대로 사용
+    norm_ticker = normalize_ticker_standard(ticker) 
     
+    # 만약 -US 같은게 안 붙은 순수 티커가 들어왔을 때를 대비해 한 번 더 체크
+    # 예: "BRK.B"가 들어오면 "BRK-B"로 변환해야 DB 키와 매칭됨
+    if '.' in norm_ticker and not any(x in norm_ticker for x in ['.KS', '.KQ', '.HK', '.T']):
+        norm_ticker = norm_ticker.replace('.', '-')
+
     if norm_ticker in GLOBAL_QUANT_DATA:
         d = GLOBAL_QUANT_DATA[norm_ticker]
         return d['1w'], d['1m'], d['3m']
@@ -890,44 +918,38 @@ with tab3:
 with tab4:
     st.markdown("### 📂 엑셀 데이터 매칭 (퀀티와이즈 DB 연동)")
     st.info("퀀티와이즈 엑셀(quant_master.xlsx)을 업로드하여 Supabase DB에 저장합니다.\n\n"
-            "**규칙:** A열(티커), D열(변화율)만 추출하며, 참여증권사(G열)는 무시합니다.\n"
-            "**중복 방지:** 오늘 날짜에 동일한 데이터(티커+값)가 이미 존재하면 저장하지 않습니다.")
+            "**규칙:** A열(티커), D열(변화율) 추출 (참여증권사 G열 무시)\n"
+            "**개선:** COF(본주)와 COF.PRK(우선주) 충돌 방지를 위해, 미국 주식은 점(.)을 하이픈(-)으로 변환하여 저장합니다.\n"
+            "(예: HEI.A -> HEI-A, COF.PRK -> COF-PRK)")
     
     uploaded_file = st.file_uploader("📥 quant_master.xlsx 파일을 드래그하여 업로드하세요", type=['xlsx'])
     
-    # --- 서브 함수: 엑셀 시트 파싱 (헤더 무시하고 데이터 추출) ---
+    # --- 서브 함수: 엑셀 시트 파싱 ---
     def parse_sheet_ticker_value(sheet_df):
         """
         데이터프레임(header=None)을 순회하며 A열(티커), D열(변화율) 추출
-        반환: { 'COF': 0.1, 'AAPL': 5.2, ... }
         """
         extracted = {}
-        # 전체 행 순회
         for index, row in sheet_df.iterrows():
             try:
-                # A열(0번): 티커 - 문자열 변환 및 공백 제거
+                # A열: 티커
                 raw_ticker = str(row[0]).strip()
-                # 빈 값이거나 이상한 헤더면 스킵
                 if not raw_ticker or raw_ticker.lower() in ['code', 'ticker', 'nan', 'item type', 'comparison date']:
                     continue
                 
-                # 티커 정규화 (COF-US -> COF)
-                norm_ticker = normalize_ticker_for_lookup(raw_ticker)
+                # [중요] 개선된 정규화 로직 사용 (점->하이픈 등)
+                norm_ticker = normalize_ticker_standard(raw_ticker)
                 
-                # D열(3번): 변화율 - 값 가져오기
+                # D열: 변화율
                 val = row[3]
-                
-                # 값이 유효한지 체크 (숫자 변환 시도)
                 if pd.isna(val) or str(val).strip() == '':
                     final_val = 0.0
                 else:
                     try:
                         final_val = float(val)
                     except:
-                        # 숫자가 아닌 문자열 헤더일 가능성 높음 -> 스킵
                         continue
                 
-                # 딕셔너리에 저장
                 extracted[norm_ticker] = final_val
                 
             except Exception:
@@ -936,11 +958,9 @@ with tab4:
 
     if uploaded_file and st.button("🔄 DB 업로드 및 분석 시작"):
         try:
-            # 1. 엑셀 파일 읽기 (헤더 없이 읽어서 직접 인덱싱)
-            # sheet_name=None을 주면 모든 시트를 dict로 읽음
+            # 1. 엑셀 파일 읽기 (헤더 없이)
             xls = pd.read_excel(uploaded_file, sheet_name=None, header=None)
             
-            # 시트 이름 매칭 (대소문자 무시 등 유연하게)
             sheet_map = {'1w': None, '1m': None, '3m': None}
             for sheet_name in xls.keys():
                 s_name = sheet_name.lower().strip()
@@ -951,38 +971,32 @@ with tab4:
             if not (sheet_map['1w'] is not None and sheet_map['1m'] is not None and sheet_map['3m'] is not None):
                 st.error("엑셀 파일에 1w, 1m, 3m 시트가 모두 있어야 합니다.")
             else:
-                # 2. 각 시트 파싱
+                # 2. 파싱 (개선된 정규화 적용)
                 data_1w = parse_sheet_ticker_value(sheet_map['1w'])
                 data_1m = parse_sheet_ticker_value(sheet_map['1m'])
                 data_3m = parse_sheet_ticker_value(sheet_map['3m'])
                 
-                # 3. 데이터 통합 (티커 기준)
-                # 모든 키(티커) 합집합 구하기
+                # 3. 데이터 통합
                 all_tickers = set(data_1w.keys()) | set(data_1m.keys()) | set(data_3m.keys())
                 
-                # 4. DB 중복 체크를 위해 오늘 저장된 데이터 미리 가져오기
+                # 4. DB 중복 체크 (오늘 날짜)
                 today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-                existing_records = []
+                existing_map = {}
                 try:
-                    # 오늘 날짜(00:00~23:59) 데이터 조회
                     res = supabase.table("quant_data")\
                         .select("*")\
                         .gte("created_at", f"{today_str} 00:00:00")\
                         .lte("created_at", f"{today_str} 23:59:59")\
                         .execute()
-                    existing_records = res.data if res.data else []
+                    if res.data:
+                        for rec in res.data:
+                            existing_map[rec['ticker']] = (
+                                float(rec.get('change_1w', 0) or 0),
+                                float(rec.get('change_1m', 0) or 0),
+                                float(rec.get('change_3m', 0) or 0)
+                            )
                 except Exception as db_e:
-                    st.warning(f"중복 체크용 DB 조회 실패(그냥 진행합니다): {db_e}")
-                
-                # 중복 판별용 딕셔너리 (Key: Ticker, Value: (1w, 1m, 3m))
-                existing_map = {}
-                for rec in existing_records:
-                    # DB 값은 float로 변환해서 저장
-                    r_ticker = rec['ticker']
-                    r_1w = float(rec.get('change_1w', 0) or 0)
-                    r_1m = float(rec.get('change_1m', 0) or 0)
-                    r_3m = float(rec.get('change_3m', 0) or 0)
-                    existing_map[r_ticker] = (r_1w, r_1m, r_3m)
+                    st.warning(f"DB 중복 조회 실패: {db_e}")
                 
                 # 5. Insert 목록 생성
                 rows_to_insert = []
@@ -993,10 +1007,9 @@ with tab4:
                     v_1m = data_1m.get(t, 0.0)
                     v_3m = data_3m.get(t, 0.0)
                     
-                    # 중복 체크: 티커가 있고 값도 모두 같으면 스킵
+                    # 중복 체크
                     if t in existing_map:
                         e_1w, e_1m, e_3m = existing_map[t]
-                        # 부동소수점 비교 주의 (아주 작은 차이는 무시하도록 round 사용 가능, 여기선 단순 비교)
                         if (e_1w == v_1w) and (e_1m == v_1m) and (e_3m == v_3m):
                             skipped_count += 1
                             continue
@@ -1008,29 +1021,26 @@ with tab4:
                         "change_3m": v_3m
                     })
                 
-                # 6. DB 저장 실행
+                # 6. 저장
                 if rows_to_insert:
-                    # Supabase는 한번에 너무 많은 행 넣으면 에러날 수 있으므로 100개씩 분할 저장 권장
                     chunk_size = 100
                     for i in range(0, len(rows_to_insert), chunk_size):
                         chunk = rows_to_insert[i:i+chunk_size]
                         supabase.table("quant_data").insert(chunk).execute()
                     
-                    st.success(f"✅ DB 업로드 완료! (신규/변경: {len(rows_to_insert)}건, 중복생략: {skipped_count}건)")
+                    st.success(f"✅ DB 업로드 완료! (저장: {len(rows_to_insert)}건, 중복생략: {skipped_count}건)")
                     
-                    # 캐시 초기화하여 즉시 반영
                     fetch_latest_quant_data_from_db.clear()
                     GLOBAL_QUANT_DATA = fetch_latest_quant_data_from_db()
-                    st.info("데이터가 갱신되었습니다. 다른 탭에서 검색 시 최신 데이터가 적용됩니다.")
+                    st.info("데이터 갱신 완료.")
                 else:
-                    st.info(f"변동 사항이 없어 저장할 데이터가 없습니다. (중복 생략: {skipped_count}건)")
+                    st.info(f"변동 사항이 없습니다. (중복 생략: {skipped_count}건)")
                 
         except Exception as e:
             st.error(f"작업 실패: {e}")
 
-    # [NEW] 현재 DB 데이터 확인 섹션
     st.markdown("---")
-    st.markdown("#### 👁️ 현재 DB에 저장된 퀀트 데이터 확인 (최신 50개)")
+    st.markdown("#### 👁️ 현재 DB 데이터 확인 (최신 50개)")
     if st.button("데이터 조회하기"):
         try:
             response = supabase.table("quant_data").select("*").order("created_at", desc=True).limit(50).execute()

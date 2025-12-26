@@ -709,79 +709,98 @@ with tab1:
                 save_to_supabase(res, "InverseHS")
             else: st.warning("조건 만족 없음")
 
-with tab2:
-    st.markdown("### 📉 저장된 종목 중 눌림목/급등주 찾기")
-    if st.button("🔍 눌림목 & 급등 패턴 분석"):
-        db_tickers = get_unique_tickers_from_db()
-        if not db_tickers: st.warning("DB 데이터 없음")
-        else:
-            st.info(f"{len(db_tickers)}개 종목 재분석 중...")
-            bar = st.progress(0); res = []
-            for i, t in enumerate(db_tickers):
-                bar.progress((i+1)/len(db_tickers))
-                rt, df = smart_download(t, "1d", "2y")
-                try:
-                    df = calculate_common_indicators(df, False)
-                    if df is None: continue
-                    curr = df.iloc[-1]
-                    cond = ""
-                    if curr['MACD_V'] > 60: cond = "🔥 공격적 추세"
-                    
-                    ema20 = df['Close'].ewm(span=20).mean().iloc[-1]
-                    if (curr['Close'] > ema20) and ((curr['Close']-ema20)/ema20 < 0.03):
-                        cond = "📉 20일선 눌림목"
-
-                    if (curr['Close'] > curr['EMA200']) and (-100 <= curr['MACD_V'] <= -50):
-                         cond = "🧲 MACD-V 과매도"
-                    
-                    if cond:
-                        res.append({
-                            '종목코드': rt, '패턴': cond, '현재가': f"{curr['Close']:,.0f}",
-                            'MACD-V': f"{curr['MACD_V']:.2f}", 'EMA20': f"{ema20:,.0f}"
-                        })
-                except: continue
-            bar.empty()
-            if res:
-                st.success(f"{len(res)}개 발견!")
-                st.dataframe(pd.DataFrame(res), use_container_width=True)
-            else: st.warning("조건 만족 종목 없음")
-
-# [NEW] 재무분석 탭
+# [NEW] 재무분석 탭 (yfinance로 변경하여 안정성 확보)
 with tab3:
-    st.markdown("### 💰 재무 지표 분석")
-    st.info("yfinance 데이터를 기반으로 핵심 재무 지표를 분석합니다.")
+    st.markdown("### 💰 재무 지표 분석 & EPS Trend")
+    st.info("yfinance 데이터를 기반으로 핵심 재무 지표 및 EPS 추정치 변화를 분석합니다.")
+    
     if st.button("📊 재무 지표 가져오기"):
         tickers = get_tickers_from_sheet()
-        if not tickers: st.error("티커 없음")
+        if not tickers: 
+            st.error("티커 없음")
         else:
-            bar = st.progress(0); f_res = []
+            bar = st.progress(0)
+            f_res = []
+            
             for i, t in enumerate(tickers):
-                bar.progress((i+1)/len(tickers))
-                rt, _ = smart_download(t, "1d", "5d")
+                bar.progress((i + 1) / len(tickers))
+                real_ticker, _ = smart_download(t, "1d", "5d") 
+                
                 try:
-                    tick = yf.Ticker(rt); info = tick.info
+                    tick = yf.Ticker(real_ticker)
+                    info = tick.info
+                    
                     if not info: continue
-                    mc = info.get('marketCap', 0)
-                    mc_str = f"{mc/1000000000000:.1f}조" if mc > 1000000000000 else f"{mc/100000000:.0f}억" if mc else "-"
-                    per = info.get('trailingPE', info.get('forwardPE', '-'))
-                    if isinstance(per, (int, float)): per = f"{per:.2f}"
-                    eps = info.get('trailingEps', info.get('forwardEps', '-'))
-                    div = info.get('dividendYield', 0)
-                    div_str = f"{div*100:.2f}%" if div else "-"
-                    pbr = info.get('priceToBook', '-'); roe = info.get('returnOnEquity', '-')
-                    if isinstance(pbr, (int, float)): pbr = f"{pbr:.2f}"
-                    if isinstance(roe, (int, float)): roe = f"{roe*100:.2f}%"
+
+                    # 시가총액
+                    mkt_cap = info.get('marketCap', 0)
+                    if mkt_cap and mkt_cap > 1000000000000: mkt_cap_str = f"{mkt_cap/1000000000000:.1f}조"
+                    elif mkt_cap: mkt_cap_str = f"{mkt_cap/100000000:.0f}억"
+                    else: mkt_cap_str = "-"
+
+                    # 매출 & EPS 성장률
+                    rev_growth = info.get('revenueGrowth', 0)
+                    rev_str = f"{rev_growth*100:.1f}%" if rev_growth else "-"
+                    eps_growth = info.get('earningsGrowth', 0)
+                    eps_growth_str = f"{eps_growth*100:.1f}%" if eps_growth else "-"
+                    
+                    # Forward EPS & PEG
+                    fwd_eps = info.get('forwardEps', '-')
+                    peg = info.get('pegRatio', '-')
+
+                    # EPS Trend (30일/90일 변화)
+                    # trend 데이터가 없는 경우도 많으므로 예외처리
+                    try:
+                        # eps_trend는 리스트 형태 [0]:Current Year, [1]:Next Year ...
+                        # usually index 0 is current year
+                        trend_data = tick.eps_trend
+                        if trend_data:
+                            # 0y: Current Year (2024 etc)
+                            curr_year_data = trend_data[0] 
+                            # 키 값 확인: 'current', '7daysAgo', '30daysAgo', '60daysAgo', '90daysAgo'
+                            curr_est = curr_year_data.get('current', 0)
+                            ago30 = curr_year_data.get('30daysAgo', 0)
+                            ago90 = curr_year_data.get('90daysAgo', 0)
+                            
+                            trend_30 = "↗️" if curr_est > ago30 else "↘️" if curr_est < ago30 else "-"
+                            trend_90 = "↗️" if curr_est > ago90 else "↘️" if curr_est < ago90 else "-"
+                            
+                            eps_trend_str = f"30일{trend_30} | 90일{trend_90}"
+                        else:
+                            eps_trend_str = "-"
+                    except:
+                        eps_trend_str = "-"
+
+                    # 투자의견 & 목표주가
+                    rec = info.get('recommendationKey', '-').upper().replace('_', ' ')
+                    target = info.get('targetMeanPrice')
+                    curr_p = info.get('currentPrice', 0)
+                    upside = f"{(target - curr_p) / curr_p * 100:.1f}%" if (target and curr_p) else "-"
+
                     f_res.append({
-                        "종목": rt, "기업명": info.get('shortName', '-'), "시가총액": mc_str,
-                        "PER": per, "EPS": eps, "PBR": pbr, "ROE": roe, "배당수익률": div_str,
-                        "목표주가": info.get('targetMeanPrice', '-')
+                        "종목": real_ticker,
+                        "섹터": info.get('sector', '-'),
+                        "산업": info.get('industry', '-'),
+                        "시가총액": mkt_cap_str,
+                        "매출성장(YoY)": rev_str,
+                        "EPS성장(YoY)": eps_growth_str,
+                        "선행EPS": fwd_eps,
+                        "PEG": peg,
+                        "EPS추세(올해)": eps_trend_str,
+                        "투자의견": rec,
+                        "상승여력": upside
                     })
-                except: continue
+                    
+                except Exception as e: continue
+            
             bar.empty()
+            
             if f_res:
-                st.success(f"✅ 총 {len(f_res)}개 기업 재무 분석 완료")
-                st.dataframe(pd.DataFrame(f_res), use_container_width=True)
-            else: st.warning("데이터 실패")
+                df_fin = pd.DataFrame(f_res)
+                st.success(f"✅ 총 {len(df_fin)}개 기업 재무/EPS 분석 완료")
+                st.dataframe(df_fin, use_container_width=True)
+            else:
+                st.warning("데이터를 가져오지 못했습니다.")
 
 st.markdown("---")
 with st.expander("🗄️ 전체 저장 기록 보기 / 관리"):

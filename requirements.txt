@@ -4,6 +4,6 @@ pandas
 numpy
 supabase
 scipy
-yahoo_fin
-requests_html
-feedparser
+openpyxl
+requests
+

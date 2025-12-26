@@ -200,12 +200,11 @@ def save_to_supabase(data_list, strategy_name):
         st.error(f"DB 저장 실패: {e}")
 
 # ==============================================================================
-# [핵심 로직 1] 엑셀 -> DB 저장 시 정규화 (Quantwise -> Standard)
+# [핵심 로직 1] 엑셀 -> DB 저장 시 정규화
 # ==============================================================================
 def normalize_ticker_for_db_storage(t):
     """
     퀀티와이즈(Excel) 티커를 DB 저장용 표준 포맷으로 변환.
-    목표: 본주와 우선주 충돌 방지, 야후 파이낸스 티커 구조와 호환.
     """
     if not t: return ""
     t_str = str(t).upper().strip()
@@ -213,10 +212,7 @@ def normalize_ticker_for_db_storage(t):
     # 1. 미국 주식 (-US)
     if t_str.endswith("-US"):
         clean = t_str[:-3]  # -US 제거
-        # [핵심] 점(.)을 하이픈(-)으로 변경하여 우선주 충돌 방지
-        # 예: COF-US -> COF
-        # 예: COF.PRK-US -> COF-PRK
-        # 예: HEI.A-US -> HEI-A
+        # 점(.)을 하이픈(-)으로 변경 (본주/우선주 충돌 방지)
         return clean.replace('.', '-')
 
     # 2. 홍콩 (-HK)
@@ -228,20 +224,16 @@ def normalize_ticker_for_db_storage(t):
         return t_str[:-3] + ".T"
         
     # 4. 한국 및 기타
-    # 퀀티와이즈 한국 주식은 보통 숫자만 있음 (005930) -> 그대로 저장
-    # 만약 -KS, -KQ가 붙어있다면 제거하고 숫자만 저장 (앱 조회 시 .KS 붙은걸 뗄 것이므로)
     if t_str.endswith("-KS"): return t_str[:-3]
     if t_str.endswith("-KQ"): return t_str[:-3]
 
-    # 그 외 하이픈이 있는 경우 (국가 코드일 가능성) -> 앞부분만 취함 (기본 처리)
-    # 단, 위에서 처리되지 않은 패턴에 대해 보수적으로 접근
     if '-' in t_str and not any(x in t_str for x in ['-US', '-HK', '-JP', '-KS', '-KQ']):
          return t_str.split('-')[0]
 
     return t_str
 
 # ==============================================================================
-# [핵심 로직 2] 앱 조회 시 정규화 (App/Yahoo -> DB Key)
+# [핵심 로직 2] 앱 조회 시 정규화
 # ==============================================================================
 def normalize_ticker_for_app_lookup(t):
     """
@@ -254,8 +246,7 @@ def normalize_ticker_for_app_lookup(t):
     if t_str.endswith(".KS"): return t_str[:-3]
     if t_str.endswith(".KQ"): return t_str[:-3]
     
-    # 2. 미국 주식 (야후는 이미 HEI-A 형태) -> DB도 HEI-A 형태이므로 그대로 사용
-    # 단, 혹시라도 .이 들어오면 -로 변경 (안전장치)
+    # 2. 미국 주식 (. -> -)
     if '.' in t_str and not any(x in t_str for x in ['.HK', '.T', '.KS', '.KQ']):
         return t_str.replace('.', '-')
         
@@ -268,22 +259,22 @@ def normalize_ticker_for_app_lookup(t):
 def fetch_latest_quant_data_from_db():
     if not supabase: return {}
     try:
-        # 최신순 정렬
+        # 최신순 정렬 (데이터는 이제 text 타입입니다)
         response = supabase.table("quant_data").select("*").order("created_at", desc=True).execute()
         if not response.data: return {}
         
         df = pd.DataFrame(response.data)
         if df.empty: return {}
         
-        # 티커 중복 제거 (가장 최신 데이터 1개만 남김)
+        # 티커 중복 제거
         df_latest = df.drop_duplicates(subset='ticker', keep='first')
         
         result_dict = {}
         for _, row in df_latest.iterrows():
             result_dict[row['ticker']] = {
-                '1w': row.get('change_1w', '-'),
-                '1m': row.get('change_1m', '-'),
-                '3m': row.get('change_3m', '-')
+                '1w': str(row.get('change_1w') or "-"),
+                '1m': str(row.get('change_1m') or "-"),
+                '3m': str(row.get('change_3m') or "-")
             }
         return result_dict
     except Exception as e:
@@ -293,10 +284,6 @@ def fetch_latest_quant_data_from_db():
 GLOBAL_QUANT_DATA = fetch_latest_quant_data_from_db()
 
 def get_eps_changes_from_db(ticker):
-    """
-    앱 내 분석 시 티커를 표준화하여 DB에서 검색
-    """
-    # 앱 티커(005930.KS) -> DB 키(005930) 변환
     norm_ticker = normalize_ticker_for_app_lookup(ticker)
     
     if norm_ticker in GLOBAL_QUANT_DATA:
@@ -864,7 +851,7 @@ with tab2:
             if res:
                 st.success(f"{len(res)}개 발견!")
                 st.dataframe(pd.DataFrame(res), use_container_width=True)
-            else: st.warning("조건 만족 종목 없음")
+            else: st.warning("조건 만족 없음")
 
 with tab3:
     st.markdown("### 💰 재무 지표 분석 & EPS Trend (yfinance)")
@@ -953,7 +940,7 @@ with tab4:
             except Exception as e:
                 st.error(f"초기화 실패 (Supabase 권한 확인 필요): {e}")
 
-    # --- 서브 함수: 엑셀 시트 파싱 (화이트리스트 필터링 추가) ---
+    # --- 서브 함수: 엑셀 시트 파싱 (화이트리스트 필터링 추가, 문자열 처리) ---
     def parse_sheet_ticker_value(sheet_df, allowed_tickers):
         extracted = {}
         for index, row in sheet_df.iterrows():
@@ -966,18 +953,17 @@ with tab4:
                 norm_ticker = normalize_ticker_for_db_storage(raw_ticker)
                 
                 # 2. [핵심] 화이트리스트 필터링
-                # 구글 시트에 있는 종목인지 확인 (없으면 저장 안함)
                 if norm_ticker not in allowed_tickers:
                     continue
 
+                # 3. [핵심] 값 가져오기 (문자열 그대로)
                 val = row[3] # D열
-                if pd.isna(val) or str(val).strip() == '':
-                    final_val = 0.0
+                if pd.isna(val):
+                    final_val = "-"
                 else:
-                    try:
-                        final_val = float(val)
-                    except:
-                        continue
+                    final_val = str(val).strip()
+                    if final_val == "":
+                        final_val = "-"
                 
                 extracted[norm_ticker] = final_val
             except Exception:
@@ -992,21 +978,14 @@ with tab4:
             tgt_etfs = [x[0] for x in get_etfs_from_sheet()]
             tgt_countries = [x[0] for x in get_country_etfs_from_sheet()]
             
-            # 관리 종목 합치기 및 정규화 (DB 포맷과 일치시키기 위해)
+            # 관리 종목 합치기 및 정규화
             raw_targets = set(tgt_stocks + tgt_etfs + tgt_countries)
             allowed_db_tickers = set()
             for t in raw_targets:
-                # 구글 시트에 있는 티커(예: 005930.KS, AAPL)를 DB 저장 포맷(005930, AAPL)으로 변환
-                # 정규화 함수 재사용 (입력이 이미 깔끔해도 안전함)
-                # 단, 구글시트의 .KS 등을 떼기 위해 normalize_ticker_for_app_lookup과 유사한 로직 필요
-                # 여기서는 normalize_ticker_for_db_storage가 가장 적합 (범용적)
-                # 구글시트: 005930 -> 005930
-                # 구글시트: AAPL -> AAPL
-                # 구글시트: 005930.KS -> 005930 (별도 처리가 필요할 수 있음)
-                
-                # 안전하게 .KS, .KQ 제거 로직 추가
-                t_clean = t.split('.')[0] # 005930.KS -> 005930, AAPL -> AAPL
-                t_clean = t_clean.split('-')[0] # 혹시 모를 하이픈 제거
+                # 구글 시트에 있는 티커를 DB 저장 포맷으로 변환
+                # 예: 005930.KS -> 005930, AAPL -> AAPL
+                t_clean = t.split('.')[0] 
+                t_clean = t_clean.split('-')[0]
                 allowed_db_tickers.add(t_clean)
             
             st.success(f"관리 대상 종목 {len(allowed_db_tickers)}개를 확인했습니다. 필터링을 시작합니다.")
@@ -1035,7 +1014,7 @@ with tab4:
                 if not all_tickers:
                     st.warning("엑셀 파일에서 관리 종목(TGT)과 일치하는 데이터를 찾지 못했습니다.")
                 else:
-                    # 4. DB 중복 체크
+                    # 4. DB 중복 체크 (문자열 비교)
                     today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
                     existing_map = {}
                     try:
@@ -1047,9 +1026,9 @@ with tab4:
                         if res.data:
                             for rec in res.data:
                                 existing_map[rec['ticker']] = (
-                                    float(rec.get('change_1w', 0) or 0),
-                                    float(rec.get('change_1m', 0) or 0),
-                                    float(rec.get('change_3m', 0) or 0)
+                                    str(rec.get('change_1w') or "-"),
+                                    str(rec.get('change_1m') or "-"),
+                                    str(rec.get('change_3m') or "-")
                                 )
                     except:
                         pass
@@ -1058,9 +1037,9 @@ with tab4:
                     skipped_count = 0
                     
                     for t in all_tickers:
-                        v_1w = data_1w.get(t, 0.0)
-                        v_1m = data_1m.get(t, 0.0)
-                        v_3m = data_3m.get(t, 0.0)
+                        v_1w = data_1w.get(t, "-")
+                        v_1m = data_1m.get(t, "-")
+                        v_3m = data_3m.get(t, "-")
                         
                         if t in existing_map:
                             e_1w, e_1m, e_3m = existing_map[t]

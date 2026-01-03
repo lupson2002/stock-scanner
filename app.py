@@ -1086,12 +1086,20 @@ with tab4:
             st.error(f"작업 실패: {e}")
 
     st.markdown("---")
-    st.markdown("#### 👁️ 현재 DB 데이터 확인 (최신 50개)")
+    st.markdown("#### 👁️ 현재 DB 저장 데이터 (전체 조회)")
     if st.button("데이터 조회하기"):
         try:
-            response = supabase.table("quant_data").select("*").order("created_at", desc=True).limit(50).execute()
+            # id, created_at 제외하고 필요한 컬럼만 선택
+            # limit 제거하여 전체 조회
+            response = supabase.table("quant_data")\
+                .select("ticker, change_1w, change_1m, change_3m")\
+                .order("created_at", desc=True)\
+                .execute()
+            
             if response.data:
-                st.dataframe(pd.DataFrame(response.data), use_container_width=True)
+                df_view = pd.DataFrame(response.data)
+                # 컬럼 이름이 그대로 나오지만, 순서 보장을 위해 명시적 선택 가능 (이미 select에서 지정했으므로 생략 가능)
+                st.dataframe(df_view, use_container_width=True)
             else:
                 st.warning("데이터가 없습니다.")
         except Exception as e:

@@ -210,7 +210,7 @@ def normalize_ticker_for_db_storage(t):
     # 1. 미국 주식 (-US)
     if t_str.endswith("-US"):
         clean = t_str[:-3]  # -US 제거
-        # 본주/우선주 충돌 방지를 위해 점(.)을 하이픈(-)으로 변경
+        # 점(.)을 하이픈(-)으로 변경
         return clean.replace('.', '-')
 
     # 2. 홍콩 (-HK)

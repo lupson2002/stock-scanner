@@ -198,7 +198,7 @@ def save_to_supabase(data_list, strategy_name):
         st.error(f"DB 저장 실패: {e}")
 
 # ==============================================================================
-# [핵심 로직] 정규화 및 DB 캐시 (한국 주식 'A' 제거 로직 추가됨)
+# [핵심 로직] 정규화 및 DB 캐시
 # ==============================================================================
 def normalize_ticker_for_db_storage(t):
     """
@@ -456,39 +456,62 @@ def check_monthly_condition(df):
         return True, {'price': curr_price, 'ath_price': ath_price, 'ath_date': ath_idx.strftime('%Y-%m'), 'month_count': month_count}
     return False, None
 
+# -----------------------------------------------------------------------------
+# [변경됨] 섹터 분석 함수 (모멘텀 점수 수정, TTM Squeeze 표시 추가)
+# -----------------------------------------------------------------------------
 def analyze_sector_trend():
     etfs = get_etfs_from_sheet()
     if not etfs: st.warning("ETF 목록 없음"); return []
     st.write(f"📊 총 {len(etfs)}개 ETF 분석 중...")
-    spy_t, spy_df = smart_download("SPY", "1d", "2y")
-    if len(spy_df) < 260: st.error("SPY 데이터 부족"); return []
-    spy_c = spy_df['Close']
-    spy_r1m = spy_c.pct_change(21).iloc[-1]; spy_r3m = spy_c.pct_change(63).iloc[-1]
-    spy_r6m = spy_c.pct_change(126).iloc[-1]; spy_r12m = spy_c.pct_change(252).iloc[-1]
+    
     results = []; pbar = st.progress(0)
     for i, (t, n) in enumerate(etfs):
         pbar.progress((i+1)/len(etfs))
         rt, df = smart_download(t, "1d", "2y")
         if len(df)<30: continue
+        
+        # 일봉 지표 계산 (TTM Squeeze 확인을 위해)
+        df = calculate_daily_indicators(df)
+        if df is None: continue
+        
         c = df['Close']; h = df['High']
+        curr=c.iloc[-1]
+        
+        # TTM Squeeze 발생 여부 (최근 5일)
+        squeeze_on = df['TTM_Squeeze'].iloc[-5:].any() if 'TTM_Squeeze' in df.columns else False
+        
+        # 보조지표들
         ema20=c.ewm(span=20).mean(); ema50=c.ewm(span=50).mean(); ema60=c.ewm(span=60).mean()
         ema100=c.ewm(span=100).mean(); ema200=c.ewm(span=200).mean()
-        curr=c.iloc[-1]
-        bb_up = ema50 + (2*c.rolling(50).std())
-        dc_h = h.rolling(50).max().shift(1)
-        tr = pd.concat([h-df['Low'], (h-c.shift()).abs(), (df['Low']-c.shift()).abs()], axis=1).max(axis=1)
-        atr = tr.ewm(span=14).mean().iloc[-1]
-        macdv, _ = calculate_macdv(df)
+        
+        bb_up = df['BB50_UP']
+        dc_h = df['Donchian_High_50']
+        macdv = df['MACD_V']
+        atr = df['ATR14'].iloc[-1]
+        
         bb_bk = "O" if (c>bb_up).iloc[-3:].any() else "-"
         dc_bk = "O" if (c>dc_h).iloc[-3:].any() else "-"
         align = "⭐ 정배열" if (curr>ema20.iloc[-1] and curr>ema60.iloc[-1] and curr>ema100.iloc[-1] and curr>ema200.iloc[-1]) else "-"
         long_tr = "📈 상승" if (ema60.iloc[-1]>ema100.iloc[-1]>ema200.iloc[-1]) else "-"
-        r1 = c.pct_change(21).iloc[-1] if len(c)>21 else 0
-        r3 = c.pct_change(63).iloc[-1] if len(c)>63 else 0
+        
+        # [변경됨] 모멘텀 점수 공식: (6개월 수익률 * 0.5) + (12개월 수익률 * 0.5)
         r6 = c.pct_change(126).iloc[-1] if len(c)>126 else 0
         r12 = c.pct_change(252).iloc[-1] if len(c)>252 else 0
-        score = (0.25*(r1-spy_r1m) + 0.25*(r3-spy_r3m) + 0.25*(r6-spy_r6m) + 0.25*(r12-spy_r12m))*100
-        results.append({"ETF":rt, "모멘텀점수":score, "BB(50,2)돌파":bb_bk, "돈키언(50)돌파":dc_bk, "정배열":align, "장기추세":long_tr, "MACD-V":f"{macdv.iloc[-1]:.2f}", "ATR":f"{atr:.2f}", "현재가":curr})
+        score = (r6 * 0.5 + r12 * 0.5) * 100
+        
+        results.append({
+            "ETF": rt, 
+            "모멘텀점수": score, 
+            "TTM Squeeze(50일)": "🔥" if squeeze_on else "-",
+            "BB(50,2)돌파": bb_bk, 
+            "돈키언(50)돌파": dc_bk, 
+            "정배열": align, 
+            "장기추세": long_tr, 
+            "MACD-V": f"{macdv.iloc[-1]:.2f}", 
+            "ATR": f"{atr:.2f}", 
+            "현재가": curr
+        })
+        
     pbar.empty()
     if results:
         df_res = pd.DataFrame(results).sort_values("모멘텀점수", ascending=False)

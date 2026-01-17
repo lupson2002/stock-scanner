@@ -457,7 +457,7 @@ def check_monthly_condition(df):
     return False, None
 
 # -----------------------------------------------------------------------------
-# [변경됨] 섹터 분석 함수 (모멘텀 점수 수정, TTM Squeeze 표시 추가)
+# [변경됨] 섹터 분석 함수 (모멘텀 점수 수정, TTM Squeeze 표시, 52주신고가 정보 추가)
 # -----------------------------------------------------------------------------
 def analyze_sector_trend():
     etfs = get_etfs_from_sheet()
@@ -499,6 +499,26 @@ def analyze_sector_trend():
         r12 = c.pct_change(252).iloc[-1] if len(c)>252 else 0
         score = (r6 * 0.5 + r12 * 0.5) * 100
         
+        # [추가됨] 52주 신고가 관련 정보 계산
+        if len(df) >= 252:
+            win_52 = df.iloc[-252:]
+            high_idx = win_52['Close'].idxmax()
+            high_52_date = high_idx.strftime('%Y-%m-%d')
+            
+            # 현재 신고가일 이전의 신고가 찾기 (전고점)
+            prev_win = win_52[win_52.index < high_idx]
+            if len(prev_win) > 0:
+                prev_idx = prev_win['Close'].idxmax()
+                prev_date = prev_idx.strftime('%Y-%m-%d')
+                diff_days = (high_idx - prev_idx).days
+            else:
+                prev_date = "-"
+                diff_days = 0
+        else:
+            high_52_date = "-"
+            prev_date = "-"
+            diff_days = 0
+        
         results.append({
             "ETF": rt, 
             "모멘텀점수": score, 
@@ -508,7 +528,10 @@ def analyze_sector_trend():
             "정배열": align, 
             "장기추세": long_tr, 
             "MACD-V": f"{macdv.iloc[-1]:.2f}", 
-            "ATR": f"{atr:.2f}", 
+            "ATR": f"{atr:.2f}",
+            "현52주신고가일": high_52_date,
+            "전52주신고가일": prev_date,
+            "차이일": f"{diff_days}일",
             "현재가": curr
         })
         

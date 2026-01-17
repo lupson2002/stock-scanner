@@ -18,7 +18,7 @@ SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJ
 # 1. 페이지 설정 및 DB 연결
 # ==========================================
 st.set_page_config(page_title="Pro 주식 검색기", layout="wide")
-st.title("📈 Pro 주식 검색기: 섹터/국가/기술적/퀀티와이즈 DB 통합")
+st.title("📈 Pro 주식 검색기: TTM Squeeze (50일) & 퀀티와이즈 통합")
 
 @st.cache_resource
 def init_supabase():
@@ -198,79 +198,43 @@ def save_to_supabase(data_list, strategy_name):
         st.error(f"DB 저장 실패: {e}")
 
 # ==============================================================================
-# [핵심 로직 1] 엑셀 -> DB 저장 시 정규화
+# [핵심 로직] 정규화 및 DB 캐시
 # ==============================================================================
 def normalize_ticker_for_db_storage(t):
-    """
-    퀀티와이즈(Excel) 티커를 DB 저장용 표준 포맷으로 변환.
-    """
     if not t: return ""
     t_str = str(t).upper().strip()
-    
-    # 1. 미국 주식 (-US)
     if t_str.endswith("-US"):
-        clean = t_str[:-3]  # -US 제거
-        # 점(.)을 하이픈(-)으로 변경
+        clean = t_str[:-3]
         return clean.replace('.', '-')
-
-    # 2. 홍콩 (-HK)
-    if t_str.endswith("-HK"):
-        return t_str[:-3] + ".HK"
-
-    # 3. 일본 (-JP)
-    if t_str.endswith("-JP"):
-        return t_str[:-3] + ".T"
-        
-    # 4. 한국 및 기타
+    if t_str.endswith("-HK"): return t_str[:-3] + ".HK"
+    if t_str.endswith("-JP"): return t_str[:-3] + ".T"
     if t_str.endswith("-KS"): return t_str[:-3]
     if t_str.endswith("-KQ"): return t_str[:-3]
-
     if '-' in t_str and not any(x in t_str for x in ['-US', '-HK', '-JP', '-KS', '-KQ']):
          return t_str.split('-')[0]
-
     return t_str
 
-# ==============================================================================
-# [핵심 로직 2] 앱 조회 시 정규화
-# ==============================================================================
 def normalize_ticker_for_app_lookup(t):
-    """
-    앱에서 분석 중인 티커(야후 포맷)를 DB 키 포맷으로 변환.
-    """
     if not t: return ""
     t_str = str(t).upper().strip()
-    
-    # 한국 주식
     if t_str.endswith(".KS"): return t_str[:-3]
     if t_str.endswith(".KQ"): return t_str[:-3]
-    
-    # 미국 주식 (. -> -)
     if '.' in t_str and not any(x in t_str for x in ['.HK', '.T', '.KS', '.KQ']):
         return t_str.replace('.', '-')
-        
     return t_str
 
-# ==========================================
-# [중요] DB 데이터 로드 (캐시) - TEXT 타입
-# ==========================================
 @st.cache_data(ttl=600) 
 def fetch_latest_quant_data_from_db():
     if not supabase: return {}
     try:
-        # DB에서 데이터를 모두 텍스트로 가져옴
         response = supabase.table("quant_data").select("*").order("created_at", desc=True).execute()
         if not response.data: return {}
-        
         df = pd.DataFrame(response.data)
         if df.empty: return {}
-        
-        # 티커 중복 제거 (최신순)
         df_latest = df.drop_duplicates(subset='ticker', keep='first')
-        
         result_dict = {}
         for _, row in df_latest.iterrows():
             result_dict[row['ticker']] = {
-                # 값이 없으면 대시(-) 처리
                 '1w': str(row.get('change_1w') or "-"),
                 '1m': str(row.get('change_1m') or "-"),
                 '3m': str(row.get('change_3m') or "-")
@@ -279,7 +243,6 @@ def fetch_latest_quant_data_from_db():
     except Exception as e:
         return {}
 
-# 앱 시작 시 DB 데이터 로드
 GLOBAL_QUANT_DATA = fetch_latest_quant_data_from_db()
 
 def get_eps_changes_from_db(ticker):
@@ -313,6 +276,7 @@ def calculate_macdv(df, short=12, long=26, signal=9):
     return macd_v, macd_v_signal
 
 def calculate_common_indicators(df, is_weekly=False):
+    # 주봉/월봉용 기존 지표 계산 함수
     if len(df) < 100: return None
     df = df.copy()
     period = 20 if is_weekly else 60
@@ -345,14 +309,40 @@ def calculate_common_indicators(df, is_weekly=False):
     df['VolSMA20'] = df['Volume'].rolling(window=20).mean()
     return df
 
+# -----------------------------------------------------------------------------
+# [변경됨] 50일 기준 TTM Squeeze가 적용된 일봉 계산 로직
+# -----------------------------------------------------------------------------
 def calculate_daily_indicators(df):
     if len(df) < 260: return None
     df = df.copy()
-    df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
+
+    # 1. 기준선 (Basis) - SMA 50 (중장기 추세)
+    df['SMA50'] = df['Close'].rolling(window=50).mean()
+    
+    # 2. 볼린저 밴드 (50, 2.0)
     df['STD50'] = df['Close'].rolling(window=50).std()
-    df['BB50_UP'] = df['EMA50'] + (2 * df['STD50'])
-    df['BB50_LO'] = df['EMA50'] - (2 * df['STD50'])
-    df['BW50'] = (df['BB50_UP'] - df['BB50_LO']) / df['EMA50']
+    df['BB50_UP'] = df['SMA50'] + (2.0 * df['STD50'])
+    df['BB50_LO'] = df['SMA50'] - (2.0 * df['STD50'])
+    df['BW50'] = (df['BB50_UP'] - df['BB50_LO']) / df['SMA50'] # 밴드폭
+
+    # 3. 켈트너 채널 (50, 1.5)
+    high_low = df['High'] - df['Low']
+    high_close = np.abs(df['High'] - df['Close'].shift())
+    low_close = np.abs(df['Low'] - df['Close'].shift())
+    df['TR'] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    
+    # ATR 50 (SMA 방식)
+    df['ATR50'] = df['TR'].rolling(window=50).mean()
+    
+    # KC 승수 1.5 적용 (진성 스퀴즈)
+    kc_mult = 1.5 
+    df['KC50_UP'] = df['SMA50'] + (kc_mult * df['ATR50'])
+    df['KC50_LO'] = df['SMA50'] - (kc_mult * df['ATR50'])
+
+    # 4. TTM Squeeze 판별 (BB가 KC 안으로 들어옴)
+    df['TTM_Squeeze'] = (df['BB50_UP'] < df['KC50_UP']) & (df['BB50_LO'] > df['KC50_LO'])
+
+    # 5. 기존 지표들 (돈키언 등)
     df['Donchian_High_50'] = df['High'].rolling(window=50).max().shift(1)
     df['Change'] = df['Close'].diff()
     df['Vol_Up'] = np.where(df['Change'] > 0, df['Volume'], 0)
@@ -362,39 +352,67 @@ def calculate_daily_indicators(df):
     roll_down = df['Vol_Down'].rolling(window=50).sum()
     roll_flat = df['Vol_Flat'].rolling(window=50).sum()
     df['VR50'] = ((roll_up + roll_flat/2) / (roll_down + roll_flat/2 + 1e-9)) * 100
+    
+    # MACD Custom
     ema_fast = df['Close'].ewm(span=20, adjust=False).mean()
     ema_slow = df['Close'].ewm(span=200, adjust=False).mean()
     df['MACD_Line_C'] = ema_fast - ema_slow
     df['MACD_Signal_C'] = df['MACD_Line_C'].ewm(span=20, adjust=False).mean()
     df['MACD_OSC_C'] = df['MACD_Line_C'] - df['MACD_Signal_C']
-    high_low = df['High'] - df['Low']
-    high_close = np.abs(df['High'] - df['Close'].shift())
-    low_close = np.abs(df['Low'] - df['Close'].shift())
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df['ATR14'] = tr.ewm(span=14, adjust=False).mean()
+    
+    # 표시용 ATR14
+    df['ATR14'] = df['TR'].ewm(span=14, adjust=False).mean()
+    
+    # MACD-V
     df['MACD_V'], _ = calculate_macdv(df, 12, 26, 9)
+    
+    # EMA200 (눌림목용)
+    df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
+    
     return df
 
+# -----------------------------------------------------------------------------
+# [변경됨] 50일 TTM Squeeze가 반영된 일봉 조건 체크 함수
+# -----------------------------------------------------------------------------
 def check_daily_condition(df):
     if len(df) < 260: return False, None
     df = calculate_daily_indicators(df)
     if df is None: return False, None
+    
     curr = df.iloc[-1]
+    
+    # 1. [필수] 가격 돌파 (돈키언 or BB상단 돌파)
     dc_cond = (df['Close'] > df['Donchian_High_50']).iloc[-3:].any()
     bb_cond = (df['Close'] > df['BB50_UP']).iloc[-3:].any()
     mandatory = dc_cond or bb_cond
+    
+    # 2. [선택] 보조 조건들
     vr_cond = (df['VR50'].iloc[-3:] > 110).any()
     bw_cond = (df['BW50'].iloc[-51] > curr['BW50']) if len(df)>55 else False
     macd_cond = curr['MACD_OSC_C'] > 0
+    
     optional_count = sum([vr_cond, bw_cond, macd_cond])
+    
     if mandatory and (optional_count >= 2):
-        squeeze = (df['BB50_UP'] < df['Donchian_High_50']).iloc[-5:].any()
+        # [변경] TTM Squeeze (50일, 1.5 ATR) 발생 여부 체크
+        squeeze_on = df['TTM_Squeeze'].iloc[-5:].any()
+        
         win_52 = df.iloc[-252:]
         high_52_date = win_52['Close'].idxmax().strftime('%Y-%m-%d')
         prev_win = win_52[win_52.index < win_52['Close'].idxmax()]
         prev_date = prev_win['Close'].idxmax().strftime('%Y-%m-%d') if len(prev_win)>0 else "-"
         diff_days = (win_52['Close'].idxmax() - prev_win['Close'].idxmax()).days if len(prev_win)>0 else 0
-        return True, {'price': curr['Close'], 'atr': curr['ATR14'], 'high_date': high_52_date, 'prev_date': prev_date, 'diff_days': diff_days, 'bw_curr': curr['BW50'], 'macdv': curr['MACD_V'], 'squeeze': "🔥Squeeze" if squeeze else "-"}
+        
+        return True, {
+            'price': curr['Close'], 
+            'atr': curr['ATR14'], 
+            'high_date': high_52_date, 
+            'prev_date': prev_date, 
+            'diff_days': diff_days, 
+            'bw_curr': curr['BW50'], 
+            'macdv': curr['MACD_V'], 
+            'squeeze': "🔥TTM Squeeze" if squeeze_on else "-"
+        }
     return False, None
 
 def check_weekly_condition(df):
@@ -519,7 +537,7 @@ def check_pullback_pattern(df):
 # 5. 메인 실행 화면
 # ==========================================
 
-st.write("주식 분석 시스템 (5-Factor 전략, MACD-V, 재무 분석)")
+st.write("주식 분석 시스템 (5-Factor 전략, MACD-V, TTM Squeeze 50일)")
 if not supabase: st.warning("⚠️ DB 연결 키 오류")
 
 tab1, tab2, tab3, tab4 = st.tabs(["📊 신규 종목 발굴", "📉 저장된 종목 눌림목 찾기", "💰 재무분석", "📂 엑셀 데이터 매칭"])
@@ -562,7 +580,7 @@ with tab1:
     if cols[2].button("🚀 일봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
-            st.info(f"[일봉 5-Factor] {len(tickers)}개 분석 시작...")
+            st.info(f"[일봉 5-Factor + TTM Squeeze] {len(tickers)}개 분석 시작...")
             bar = st.progress(0); res = []
             for i, t in enumerate(tickers):
                 bar.progress((i+1)/len(tickers))
@@ -827,16 +845,21 @@ with tab2:
                 bar.progress((i+1)/len(db_tickers))
                 rt, df = smart_download(t, "1d", "2y")
                 try:
-                    df = calculate_common_indicators(df, False)
+                    # 일봉 계산 로직 활용 (SMA50, MACD-V 등 포함됨)
+                    df = calculate_daily_indicators(df)
                     if df is None: continue
                     curr = df.iloc[-1]
                     cond = ""
                     if curr['MACD_V'] > 60: cond = "🔥 공격적 추세"
+                    
+                    # 눌림목 체크 (20일선 기준) - calculate_common_indicators 로직 일부 차용
                     ema20 = df['Close'].ewm(span=20).mean().iloc[-1]
                     if (curr['Close'] > ema20) and ((curr['Close']-ema20)/ema20 < 0.03):
                         cond = "📉 20일선 눌림목"
+                    
                     if (curr['Close'] > curr['EMA200']) and (-100 <= curr['MACD_V'] <= -50):
                          cond = "🧲 MACD-V 과매도"
+                    
                     if cond:
                         eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
                         res.append({

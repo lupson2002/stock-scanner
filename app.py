@@ -198,20 +198,40 @@ def save_to_supabase(data_list, strategy_name):
         st.error(f"DB 저장 실패: {e}")
 
 # ==============================================================================
-# [핵심 로직] 정규화 및 DB 캐시
+# [핵심 로직] 정규화 및 DB 캐시 (한국 주식 'A' 제거 로직 추가됨)
 # ==============================================================================
 def normalize_ticker_for_db_storage(t):
+    """
+    QuantWise 엑셀 티커를 DB/Yahoo Finance 공통 포맷으로 변환
+    """
     if not t: return ""
     t_str = str(t).upper().strip()
+    
+    # 1. 한국 주식: 'A'로 시작하고 뒤가 6자리 숫자인 경우 (예: A005930 -> 005930)
+    if t_str.startswith('A') and len(t_str) == 7 and t_str[1:].isdigit():
+        return t_str[1:]
+
+    # 2. 미국 주식 (-US)
     if t_str.endswith("-US"):
-        clean = t_str[:-3]
+        clean = t_str[:-3]  # -US 제거
         return clean.replace('.', '-')
-    if t_str.endswith("-HK"): return t_str[:-3] + ".HK"
-    if t_str.endswith("-JP"): return t_str[:-3] + ".T"
+
+    # 3. 홍콩 (-HK)
+    if t_str.endswith("-HK"):
+        return t_str[:-3] + ".HK"
+
+    # 4. 일본 (-JP)
+    if t_str.endswith("-JP"):
+        return t_str[:-3] + ".T"
+        
+    # 5. 기존 한국 포맷 (-KS, -KQ) 제거
     if t_str.endswith("-KS"): return t_str[:-3]
     if t_str.endswith("-KQ"): return t_str[:-3]
-    if '-' in t_str and not any(x in t_str for x in ['-US', '-HK', '-JP', '-KS', '-KQ']):
+
+    # 6. 기타 하이픈 처리
+    if '-' in t_str and not any(x in t_str for x in ['.HK', '.T']):
          return t_str.split('-')[0]
+
     return t_str
 
 def normalize_ticker_for_app_lookup(t):

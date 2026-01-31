@@ -11,7 +11,6 @@ import re
 # =========================================================
 # [설정] Supabase 연결 정보
 # =========================================================
-# Streamlit Secrets를 사용하는 것이 안전하지만, 요청하신 대로 코드를 유지합니다.
 SUPABASE_URL = "https://sgpzmkfproftswevwybm.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNncHpta2Zwcm9mdHN3ZXZ3eWJtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjQ5OTQ0MDEsImV4cCI6MjA4MDU3MDQwMX0.VwStTHOr7_SqYrfwqol1E3ab89HsoUArV1q1s7UFAR4"
 
@@ -447,6 +446,9 @@ def check_monthly_condition(df):
         return True, {'price': curr_price, 'ath_price': ath_price, 'ath_date': ath_idx.strftime('%Y-%m'), 'month_count': month_count}
     return False, None
 
+# -----------------------------------------------------------------------------
+# [수정됨] 섹터 분석 함수: 모멘텀 스코어 C안 적용 ((12M - 3M) + 1M)
+# -----------------------------------------------------------------------------
 def analyze_sector_trend():
     etfs = get_etfs_from_sheet()
     if not etfs: st.warning("ETF 목록 없음"); return []
@@ -475,9 +477,14 @@ def analyze_sector_trend():
         align = "⭐ 정배열" if (curr>ema20.iloc[-1] and curr>ema60.iloc[-1] and curr>ema100.iloc[-1] and curr>ema200.iloc[-1]) else "-"
         long_tr = "📈 상승" if (ema60.iloc[-1]>ema100.iloc[-1]>ema200.iloc[-1]) else "-"
         
-        r6 = c.pct_change(126).iloc[-1] if len(c)>126 else 0
-        r12 = c.pct_change(252).iloc[-1] if len(c)>252 else 0
-        score = (r6 * 0.5 + r12 * 0.5) * 100
+        # [수정됨] 모멘텀 스코어 C안: (12개월 - 3개월) + 1개월
+        # 12개월(252일), 3개월(63일), 1개월(21일) 기준
+        r12 = c.pct_change(252).iloc[-1] if len(c) > 252 else 0
+        r3 = c.pct_change(63).iloc[-1] if len(c) > 63 else 0
+        r1 = c.pct_change(21).iloc[-1] if len(c) > 21 else 0
+        
+        # 공식 적용 및 백분율 환산
+        score = ((r12 - r3) + r1) * 100
         
         if len(df) >= 252:
             win_52 = df.iloc[-252:]

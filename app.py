@@ -302,6 +302,7 @@ def calculate_common_indicators(df, is_weekly=False):
     # MACD-V
     df['MACD_V'], df['MACD_V_Signal'] = calculate_macdv(df, 12, 26, 9)
     
+    # 기타 지표
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
     low_close = np.abs(df['Low'] - df['Close'].shift())
@@ -310,10 +311,14 @@ def calculate_common_indicators(df, is_weekly=False):
     
     return df
 
+# -----------------------------------------------------------------------------
+# [수정 완료] 일봉 지표: 50일 전략 유지 + 20일 스퀴즈 추가 계산
+# -----------------------------------------------------------------------------
 def calculate_daily_indicators(df):
     if len(df) < 260: return None
     df = df.copy()
-    # SMA 50 기준선
+    
+    # === [A] 기존 50일 기반 지표 (5-Factor 전략용 - 유지) ===
     df['SMA50'] = df['Close'].rolling(window=50).mean()
     
     # BB (50, 2.0)
@@ -322,21 +327,10 @@ def calculate_daily_indicators(df):
     df['BB50_LO'] = df['SMA50'] - (2.0 * df['STD50'])
     df['BW50'] = (df['BB50_UP'] - df['BB50_LO']) / df['SMA50']
 
-    # KC (50, 1.5) - TTM Squeeze용
-    high_low = df['High'] - df['Low']
-    high_close = np.abs(df['High'] - df['Close'].shift())
-    low_close = np.abs(df['Low'] - df['Close'].shift())
-    df['TR'] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df['ATR50'] = df['TR'].rolling(window=50).mean()
-    kc_mult = 1.5 
-    df['KC50_UP'] = df['SMA50'] + (kc_mult * df['ATR50'])
-    df['KC50_LO'] = df['SMA50'] - (kc_mult * df['ATR50'])
-
-    # TTM Squeeze 판별
-    df['TTM_Squeeze'] = (df['BB50_UP'] < df['KC50_UP']) & (df['BB50_LO'] > df['KC50_LO'])
-
-    # 돈키언 등
+    # 돈키언 채널 (50일)
     df['Donchian_High_50'] = df['High'].rolling(window=50).max().shift(1)
+    
+    # 거래량 강도 (VR50)
     df['Change'] = df['Close'].diff()
     df['Vol_Up'] = np.where(df['Change'] > 0, df['Volume'], 0)
     df['Vol_Down'] = np.where(df['Change'] < 0, df['Volume'], 0)
@@ -346,7 +340,30 @@ def calculate_daily_indicators(df):
     roll_flat = df['Vol_Flat'].rolling(window=50).sum()
     df['VR50'] = ((roll_up + roll_flat/2) / (roll_down + roll_flat/2 + 1e-9)) * 100
     
-    # MACD Custom (20, 200) - 일봉용 추세
+    # === [B] TTM Squeeze용 20일 지표 (신규 추가/변경) ===
+    df['SMA20'] = df['Close'].rolling(window=20).mean()
+    
+    # BB (20, 2.0)
+    df['STD20'] = df['Close'].rolling(window=20).std()
+    df['BB20_UP'] = df['SMA20'] + (2.0 * df['STD20'])
+    df['BB20_LO'] = df['SMA20'] - (2.0 * df['STD20'])
+    
+    # KC (20, 1.5)
+    high_low = df['High'] - df['Low']
+    high_close = np.abs(df['High'] - df['Close'].shift())
+    low_close = np.abs(df['Low'] - df['Close'].shift())
+    df['TR'] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    
+    df['ATR20'] = df['TR'].rolling(window=20).mean()
+    kc_mult = 1.5 
+    df['KC20_UP'] = df['SMA20'] + (kc_mult * df['ATR20'])
+    df['KC20_LO'] = df['SMA20'] - (kc_mult * df['ATR20'])
+
+    # [변경됨] TTM Squeeze 판별 (20일 기준)
+    df['TTM_Squeeze'] = (df['BB20_UP'] < df['KC20_UP']) & (df['BB20_LO'] > df['KC20_LO'])
+
+    # === [C] 기타 ===
+    # MACD Custom (20, 200) - 추세용
     ema_fast = df['Close'].ewm(span=20, adjust=False).mean()
     ema_slow = df['Close'].ewm(span=200, adjust=False).mean()
     df['MACD_Line_C'] = ema_fast - ema_slow
@@ -359,12 +376,16 @@ def calculate_daily_indicators(df):
     
     return df
 
+# -----------------------------------------------------------------------------
+# 일봉 조건 체크: 50일 지표 사용 (전략 유지), 스퀴즈는 20일값 사용
+# -----------------------------------------------------------------------------
 def check_daily_condition(df):
     if len(df) < 260: return False, None
     df = calculate_daily_indicators(df)
     if df is None: return False, None
     curr = df.iloc[-1]
     
+    # [유지] 50일 기준 전략
     dc_cond = (df['Close'] > df['Donchian_High_50']).iloc[-3:].any()
     bb_cond = (df['Close'] > df['BB50_UP']).iloc[-3:].any()
     mandatory = dc_cond or bb_cond
@@ -375,7 +396,9 @@ def check_daily_condition(df):
     optional_count = sum([vr_cond, bw_cond, macd_cond])
     
     if mandatory and (optional_count >= 2):
+        # [변경] 스퀴즈는 위에서 계산한 20일 기준값 가져옴
         squeeze_on = df['TTM_Squeeze'].iloc[-5:].any()
+        
         win_52 = df.iloc[-252:]
         high_52_date = win_52['Close'].idxmax().strftime('%Y-%m-%d')
         prev_win = win_52[win_52.index < win_52['Close'].idxmax()]
@@ -390,7 +413,7 @@ def check_daily_condition(df):
             'diff_days': diff_days, 
             'bw_curr': curr['BW50'], 
             'macdv': curr['MACD_V'], 
-            'squeeze': "🔥TTM Squeeze" if squeeze_on else "-"
+            'squeeze': "🔥TTM Squeeze" if squeeze_on else "-" # 20일 기준
         }
     return False, None
 
@@ -434,7 +457,7 @@ def check_monthly_condition(df):
     return False, None
 
 # -----------------------------------------------------------------------------
-# [NEW] 공용 모멘텀 분석 함수 (섹터 & 국가 탭에서 공유)
+# [수정됨] 공용 모멘텀 분석 함수 (섹터/국가)
 # -----------------------------------------------------------------------------
 def analyze_momentum_strategy(target_list, type_name="ETF"):
     if not target_list: return pd.DataFrame()
@@ -450,12 +473,15 @@ def analyze_momentum_strategy(target_list, type_name="ETF"):
         if df is None: continue
         
         c = df['Close']; curr=c.iloc[-1]
+        
+        # [변경] 스퀴즈: 20일 기준
         squeeze_on = df['TTM_Squeeze'].iloc[-5:].any() if 'TTM_Squeeze' in df.columns else False
         
+        # [유지] 화면 표시용 보조 지표들은 기존대로 50일 기준 유지 (원복)
         ema20=c.ewm(span=20).mean(); ema50=c.ewm(span=50).mean(); ema60=c.ewm(span=60).mean()
         ema100=c.ewm(span=100).mean(); ema200=c.ewm(span=200).mean()
         
-        bb_up = df['BB50_UP']; dc_h = df['Donchian_High_50']
+        bb_up = df['BB50_UP']; dc_h = df['Donchian_High_50'] # 50일 유지
         macdv = df['MACD_V']; atr = df['ATR14'].iloc[-1]
         
         bb_bk = "O" if (c>bb_up).iloc[-3:].any() else "-"
@@ -463,11 +489,10 @@ def analyze_momentum_strategy(target_list, type_name="ETF"):
         align = "⭐ 정배열" if (curr>ema20.iloc[-1] and curr>ema60.iloc[-1] and curr>ema100.iloc[-1] and curr>ema200.iloc[-1]) else "-"
         long_tr = "📈 상승" if (ema60.iloc[-1]>ema100.iloc[-1]>ema200.iloc[-1]) else "-"
         
-        # [모멘텀 스코어 C안]: (12개월 - 3개월) + 1개월
+        # [유지] 모멘텀 스코어 C안: (12M - 3M) + 1M
         r12 = c.pct_change(252).iloc[-1] if len(c) > 252 else 0
         r3 = c.pct_change(63).iloc[-1] if len(c) > 63 else 0
         r1 = c.pct_change(21).iloc[-1] if len(c) > 21 else 0
-        
         score = ((r12 - r3) + r1) * 100
         
         if len(df) >= 252:
@@ -487,9 +512,9 @@ def analyze_momentum_strategy(target_list, type_name="ETF"):
         results.append({
             f"{type_name}": f"{rt} ({n})", 
             "모멘텀점수": score, 
-            "TTM Squeeze(50일)": "🔥" if squeeze_on else "-",
-            "BB(50,2)돌파": bb_bk, 
-            "돈키언(50)돌파": dc_bk, 
+            "스퀴즈": "🔥" if squeeze_on else "-", # 컬럼명 '스퀴즈'로 통일 (20일 기준)
+            "BB(50,2)돌파": bb_bk, # 50일 유지
+            "돈키언(50)돌파": dc_bk, # 50일 유지
             "정배열": align, 
             "장기추세": long_tr, 
             "MACD-V": f"{macdv.iloc[-1]:.2f}", 
@@ -568,7 +593,7 @@ def check_pullback_pattern(df):
 # 5. 메인 실행 화면
 # ==========================================
 
-st.write("주식 분석 시스템 (5-Factor 전략, MACD-V, TTM Squeeze 50일)")
+st.write("주식 분석 시스템 (5-Factor 전략, MACD-V, TTM Squeeze 20일)")
 if not supabase: st.warning("⚠️ DB 연결 키 오류")
 
 tab1, tab2, tab3, tab4 = st.tabs(["📊 신규 종목 발굴", "📉 저장된 종목 눌림목 찾기", "💰 재무분석", "📂 엑셀 데이터 매칭"])
@@ -576,9 +601,6 @@ tab1, tab2, tab3, tab4 = st.tabs(["📊 신규 종목 발굴", "📉 저장된 �
 with tab1:
     cols = st.columns(11) 
     
-    # --------------------------------------------------------
-    # [수정됨] 섹터 탭: 공용 모멘텀 분석 함수 호출
-    # --------------------------------------------------------
     if cols[0].button("🌍 섹터"):
         etfs = get_etfs_from_sheet()
         if not etfs:
@@ -589,16 +611,12 @@ with tab1:
             if not res.empty: st.dataframe(res, use_container_width=True)
             else: st.warning("데이터 부족")
 
-    # --------------------------------------------------------
-    # [수정됨] 국가 탭: 기존 소스 + 섹터와 동일한 모멘텀 분석 적용
-    # --------------------------------------------------------
     if cols[1].button("🏳️ 국가"):
         tickers = get_country_etfs_from_sheet()
         if not tickers:
             st.warning("국가 ETF 목록 없음")
         else:
             st.info(f"[국가 ETF] {len(tickers)}개 모멘텀(C안) 분석 시작...")
-            # analyze_momentum_strategy 함수 재사용 (로직/화면 동일)
             res = analyze_momentum_strategy(tickers, "국가ETF")
             if not res.empty:
                 st.success(f"[국가] {len(res)}개 분석 완료!")
@@ -608,7 +626,7 @@ with tab1:
     if cols[2].button("🚀 일봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
-            st.info(f"[일봉 5-Factor + TTM Squeeze] {len(tickers)}개 분석 시작...")
+            st.info(f"[일봉 5-Factor + TTM Squeeze 20일] {len(tickers)}개 분석 시작...")
             bar = st.progress(0); res = []
             for i, t in enumerate(tickers):
                 bar.progress((i+1)/len(tickers))
@@ -957,6 +975,9 @@ with tab3:
                 st.dataframe(df_fin, use_container_width=True)
             else: st.warning("데이터를 가져오지 못했습니다.")
 
+# ==============================================================================
+# [NEW] 4. 엑셀 데이터 매칭 탭 (DB 저장 & 초기화 & 화이트리스트 적용)
+# ==============================================================================
 with tab4:
     st.markdown("### 📂 엑셀 데이터 매칭 (퀀티와이즈 DB 연동)")
     st.info("퀀티와이즈 엑셀(quant_master.xlsx)을 업로드하여 Supabase DB에 저장합니다.\n\n"
@@ -970,19 +991,23 @@ with tab4:
     with col_upload:
         uploaded_file = st.file_uploader("📥 quant_master.xlsx 파일을 드래그하여 업로드하세요", type=['xlsx'])
     
+    # [DB 초기화 버튼]
     with col_reset:
-        st.write("") 
+        st.write("") # 줄맞춤
         st.write("") 
         if st.button("🗑️ [주의] DB 초기화 (전체 삭제)", type="primary"):
             try:
+                # 모든 데이터 삭제 (id가 0이 아닌 모든 행)
                 supabase.table("quant_data").delete().neq("id", 0).execute()
                 st.success("DB가 초기화되었습니다. 이제 파일을 업로드하세요.")
                 fetch_latest_quant_data_from_db.clear()
             except Exception as e:
                 st.error(f"초기화 실패 (Supabase 권한 확인 필요): {e}")
 
+    # [디버깅 옵션]
     show_debug_log = st.checkbox("🔍 디버깅 로그 보기 (왜 저장이 안 되는지 확인)")
 
+    # --- 서브 함수: 엑셀 시트 파싱 (화이트리스트 필터링 추가, 문자열 처리) ---
     def parse_sheet_ticker_value(sheet_df, allowed_tickers, debug_mode=False):
         extracted = {}
         for index, row in sheet_df.iterrows():
@@ -991,19 +1016,24 @@ with tab4:
                 if not raw_ticker or raw_ticker.lower() in ['code', 'ticker', 'nan', 'item type', 'comparison date']:
                     continue
                 
+                # 1. 정규화 (Quant -> DB Format)
                 norm_ticker = normalize_ticker_for_db_storage(raw_ticker)
                 
+                # [디버깅] 특정 티커가 어떻게 처리되는지 확인
                 if debug_mode and "RKLB" in norm_ticker:
                     st.write(f"📢 [DEBUG] 발견된 티커: {raw_ticker} -> 정규화: {norm_ticker} -> 화이트리스트 포함 여부: {norm_ticker in allowed_tickers}")
 
+                # 2. [핵심] 화이트리스트 필터링
                 if norm_ticker not in allowed_tickers:
                     continue
 
-                val = row[3] 
+                # 3. [핵심] 값 가져오기 (문자열 그대로)
+                val = row[3] # D열
                 if pd.isna(val):
                     final_val = "-"
                 else:
                     final_val = str(val).strip()
+                    # 문자열 "nan" 또는 빈 값 처리
                     if final_val.lower() == 'nan' or final_val == "":
                         final_val = "-"
                 
@@ -1014,14 +1044,18 @@ with tab4:
 
     if uploaded_file and st.button("🔄 DB 업로드 및 분석 시작"):
         try:
+            # 0. 구글 시트에서 관리 종목(Target) 가져오기
             st.info("구글 시트에서 관리 종목(TGT) 목록을 불러오는 중...")
             tgt_stocks = get_tickers_from_sheet()
             tgt_etfs = [x[0] for x in get_etfs_from_sheet()]
             tgt_countries = [x[0] for x in get_country_etfs_from_sheet()]
             
+            # 관리 종목 합치기 및 정규화
             raw_targets = set(tgt_stocks + tgt_etfs + tgt_countries)
             allowed_db_tickers = set()
             for t in raw_targets:
+                # 구글 시트에 있는 티커를 DB 저장 포맷으로 변환
+                # 예: 005930.KS -> 005930, AAPL -> AAPL
                 t_clean = t.split('.')[0] 
                 t_clean = t_clean.split('-')[0]
                 allowed_db_tickers.add(t_clean)
@@ -1034,6 +1068,8 @@ with tab4:
                 else:
                     st.error("❌ RKLB가 관리 종목(TGT) 목록에 없습니다! 구글 시트를 확인하세요.")
 
+            # 1. 엑셀 파일 읽기 (모든 데이터를 문자열로 읽기)
+            # [중요] dtype=str 옵션을 줘서 처음부터 문자로 읽어들임
             xls = pd.read_excel(uploaded_file, sheet_name=None, header=None, dtype=str)
             
             sheet_map = {'1w': None, '1m': None, '3m': None}
@@ -1046,15 +1082,18 @@ with tab4:
             if not (sheet_map['1w'] is not None and sheet_map['1m'] is not None and sheet_map['3m'] is not None):
                 st.error("엑셀 파일에 1w, 1m, 3m 시트가 모두 있어야 합니다.")
             else:
+                # 2. 파싱 (화이트리스트 전달)
                 data_1w = parse_sheet_ticker_value(sheet_map['1w'], allowed_db_tickers, show_debug_log)
                 data_1m = parse_sheet_ticker_value(sheet_map['1m'], allowed_db_tickers, show_debug_log)
                 data_3m = parse_sheet_ticker_value(sheet_map['3m'], allowed_db_tickers, show_debug_log)
                 
+                # 3. 통합
                 all_tickers = set(data_1w.keys()) | set(data_1m.keys()) | set(data_3m.keys())
                 
                 if not all_tickers:
                     st.warning("엑셀 파일에서 관리 종목(TGT)과 일치하는 데이터를 찾지 못했습니다.")
                 else:
+                    # 4. DB 중복 체크 (문자열 비교)
                     today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
                     existing_map = {}
                     try:
@@ -1081,6 +1120,7 @@ with tab4:
                         v_1m = data_1m.get(t, "-")
                         v_3m = data_3m.get(t, "-")
                         
+                        # 중복 체크 (문자열 그대로 비교)
                         if t in existing_map:
                             e_1w, e_1m, e_3m = existing_map[t]
                             if (e_1w == v_1w) and (e_1m == v_1m) and (e_3m == v_3m):
@@ -1095,6 +1135,7 @@ with tab4:
                         })
                     
                     if rows_to_insert:
+                        # 100개씩 나눠서 저장
                         chunk_size = 100
                         for i in range(0, len(rows_to_insert), chunk_size):
                             chunk = rows_to_insert[i:i+chunk_size]
@@ -1102,6 +1143,7 @@ with tab4:
                         
                         st.success(f"✅ DB 업로드 완료! (TGT 필터링 적용됨. 신규: {len(rows_to_insert)}건, 중복생략: {skipped_count}건)")
                         
+                        # 캐시 초기화
                         fetch_latest_quant_data_from_db.clear()
                         GLOBAL_QUANT_DATA = fetch_latest_quant_data_from_db()
                     else:
@@ -1114,6 +1156,8 @@ with tab4:
     st.markdown("#### 👁️ 현재 DB 저장 데이터 (전체 조회)")
     if st.button("데이터 조회하기"):
         try:
+            # id, created_at 제외하고 필요한 컬럼만 선택
+            # limit 제거하여 전체 조회
             response = supabase.table("quant_data")\
                 .select("ticker, change_1w, change_1m, change_3m")\
                 .order("created_at", desc=True)\
@@ -1121,6 +1165,7 @@ with tab4:
             
             if response.data:
                 df_view = pd.DataFrame(response.data)
+                # 컬럼 이름이 그대로 나오지만, 순서 보장을 위해 명시적 선택 가능 (이미 select에서 지정했으므로 생략 가능)
                 st.dataframe(df_view, use_container_width=True)
             else:
                 st.warning("데이터가 없습니다.")

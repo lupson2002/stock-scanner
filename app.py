@@ -311,7 +311,7 @@ def calculate_common_indicators(df, is_weekly=False):
     return df
 
 # -----------------------------------------------------------------------------
-# [수정 완료] 일봉 지표: 50일 전략 유지 + 20일 스퀴즈 추가 계산
+# 일봉 지표 계산: 50일 전략 유지 + 20일 스퀴즈 추가 계산
 # -----------------------------------------------------------------------------
 def calculate_daily_indicators(df):
     if len(df) < 260: return None
@@ -319,17 +319,12 @@ def calculate_daily_indicators(df):
     
     # === [A] 기존 50일 기반 지표 (5-Factor 전략용 - 유지) ===
     df['SMA50'] = df['Close'].rolling(window=50).mean()
-    
-    # BB (50, 2.0)
     df['STD50'] = df['Close'].rolling(window=50).std()
     df['BB50_UP'] = df['SMA50'] + (2.0 * df['STD50'])
     df['BB50_LO'] = df['SMA50'] - (2.0 * df['STD50'])
     df['BW50'] = (df['BB50_UP'] - df['BB50_LO']) / df['SMA50']
-
-    # 돈키언 채널 (50일)
     df['Donchian_High_50'] = df['High'].rolling(window=50).max().shift(1)
     
-    # 거래량 강도 (VR50)
     df['Change'] = df['Close'].diff()
     df['Vol_Up'] = np.where(df['Change'] > 0, df['Volume'], 0)
     df['Vol_Down'] = np.where(df['Change'] < 0, df['Volume'], 0)
@@ -341,28 +336,21 @@ def calculate_daily_indicators(df):
     
     # === [B] TTM Squeeze용 20일 지표 (신규 추가/변경) ===
     df['SMA20'] = df['Close'].rolling(window=20).mean()
-    
-    # BB (20, 2.0)
     df['STD20'] = df['Close'].rolling(window=20).std()
     df['BB20_UP'] = df['SMA20'] + (2.0 * df['STD20'])
     df['BB20_LO'] = df['SMA20'] - (2.0 * df['STD20'])
     
-    # KC (20, 1.5)
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
     low_close = np.abs(df['Low'] - df['Close'].shift())
     df['TR'] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    
     df['ATR20'] = df['TR'].rolling(window=20).mean()
     kc_mult = 1.5 
     df['KC20_UP'] = df['SMA20'] + (kc_mult * df['ATR20'])
     df['KC20_LO'] = df['SMA20'] - (kc_mult * df['ATR20'])
-
-    # [변경됨] TTM Squeeze 판별 (20일 기준)
     df['TTM_Squeeze'] = (df['BB20_UP'] < df['KC20_UP']) & (df['BB20_LO'] > df['KC20_LO'])
 
     # === [C] 기타 ===
-    # MACD Custom (20, 200) - 추세용
     ema_fast = df['Close'].ewm(span=20, adjust=False).mean()
     ema_slow = df['Close'].ewm(span=200, adjust=False).mean()
     df['MACD_Line_C'] = ema_fast - ema_slow
@@ -376,42 +364,32 @@ def calculate_daily_indicators(df):
     return df
 
 # -----------------------------------------------------------------------------
-# [수정됨] VCP 패턴 확인 로직 (Minervini) - 4단계 버그 수정
+# VCP 패턴 확인 로직 (Minervini)
 # -----------------------------------------------------------------------------
 def check_vcp_pattern(df):
     if len(df) < 250: return False, None
-    df = calculate_daily_indicators(df) # 스퀴즈 확인용
+    df = calculate_daily_indicators(df) 
     if df is None: return False, None
     
-    # 1단계: 추세 템플릿 (Trend Template) 확인
     curr = df.iloc[-1]
     sma50 = df['Close'].rolling(50).mean().iloc[-1]
     sma150 = df['Close'].rolling(150).mean().iloc[-1]
     sma200 = df['Close'].rolling(200).mean().iloc[-1]
     
-    # 1-1. 주가 > 150일, 200일선
     cond1 = curr['Close'] > sma150 and curr['Close'] > sma200
-    # 1-2. 150일선 > 200일선
     cond2 = sma150 > sma200
-    # 1-3. 200일선 상승 추세 (최근 1달)
-    cond3 = df['SMA50'].iloc[-1] > df['SMA50'].iloc[-20] # SMA50으로 대체 (좀 더 반응 빠름)
-    # 1-4. 50일선 > 150일선 (정배열)
+    cond3 = df['SMA50'].iloc[-1] > df['SMA50'].iloc[-20] 
     cond4 = sma50 > sma150
-    # 1-5. 52주 신저가 대비 25% 이상 상승
     low_52 = df['Low'].iloc[-252:].min()
     cond5 = curr['Close'] > low_52 * 1.25
-    # 1-6. 52주 신고가 대비 25% 이내 (근처)
     high_52 = df['High'].iloc[-252:].max()
     cond6 = curr['Close'] > high_52 * 0.75
     
     stage_1_pass = cond1 and cond2 and cond4 and cond5 and cond6
-    if not stage_1_pass: return False, None # 추세 없으면 탈락
+    if not stage_1_pass: return False, None 
 
-    # 2단계: 변동성 축소 확인 (Contraction)
-    # 최근 60일 데이터로 3등분
     window = 60
     subset = df.iloc[-window:]
-    
     p1 = subset.iloc[:20]
     p2 = subset.iloc[20:40]
     p3 = subset.iloc[40:]
@@ -420,37 +398,27 @@ def check_vcp_pattern(df):
     range2 = (p2['High'].max() - p2['Low'].min()) / p2['High'].max()
     range3 = (p3['High'].max() - p3['Low'].min()) / p3['High'].max()
     
-    # 변동성이 줄어드는 경향 (완벽하지 않아도 됨) or 마지막이 10% 이내
     contraction = (range3 < range2) or (range2 < range1) or (range3 < 0.12)
     if not contraction: return False, None
 
-    # 3단계: 마지막 수렴 및 거래량 감소 (Setup)
     last_vol_avg = p3['Volume'].mean()
     prev_vol_avg = p1['Volume'].mean()
-    vol_dry_up = last_vol_avg < prev_vol_avg * 1.2 # 거래량 감소 (유연하게 1.2배까지 허용)
-    tight_area = range3 < 0.15 # 마지막 변동폭 15% 이내 (유연하게)
+    vol_dry_up = last_vol_avg < prev_vol_avg * 1.2 
+    tight_area = range3 < 0.15 
     
     stage_3_pass = vol_dry_up and tight_area
     
-    # 손절가: 마지막 구간 저점
     stop_loss = p3['Low'].min()
-    # 목표가: 리스크(진입가-손절가)의 3배
     risk = curr['Close'] - stop_loss
     target_price = curr['Close'] + (risk * 3) if risk > 0 else 0
     
-    # [핵심 수정] 4단계: 돌파 (Breakout)
-    # **중요**: 오늘을 포함하지 않은 '어제까지의' 최근 고점(Pivot)을 넘었는가?
-    # p3는 오늘 포함 최근 20일이므로, p3[:-1]은 오늘 제외 최근 19일
     prior_days = p3.iloc[:-1] 
-    
     if len(prior_days) > 0:
-        pivot_point = prior_days['High'].max() # 어제까지의 박스권 고점
+        pivot_point = prior_days['High'].max() 
     else:
-        pivot_point = p3['High'].max() # 데이터 부족 시 그냥 사용
+        pivot_point = p3['High'].max() 
 
-    # 돌파 조건: 종가가 피봇보다 높고, 거래량이 평소보다 터졌는가?
-    vol_ma20 = df['Volume'].iloc[-21:-1].mean() # 어제까지의 평균 거래량
-    
+    vol_ma20 = df['Volume'].iloc[-21:-1].mean() 
     breakout = (curr['Close'] > pivot_point) and (curr['Volume'] > vol_ma20 * 1.2)
     
     status = ""
@@ -459,7 +427,6 @@ def check_vcp_pattern(df):
     elif stage_3_pass and breakout:
         status = "4단계 (돌파!🚀)"
     else:
-        # 3단계 조건을 완벽히 충족 못해도 돌파가 나오면 잡히도록
         if breakout and tight_area:
              status = "4단계 (돌파!🚀)"
         else:
@@ -473,16 +440,12 @@ def check_vcp_pattern(df):
         'price': curr['Close']
     }
 
-# -----------------------------------------------------------------------------
-# 일봉 조건 체크: 50일 지표 사용 (전략 유지), 스퀴즈는 20일값 사용
-# -----------------------------------------------------------------------------
 def check_daily_condition(df):
     if len(df) < 260: return False, None
     df = calculate_daily_indicators(df)
     if df is None: return False, None
     curr = df.iloc[-1]
     
-    # [유지] 50일 기준 전략
     dc_cond = (df['Close'] > df['Donchian_High_50']).iloc[-3:].any()
     bb_cond = (df['Close'] > df['BB50_UP']).iloc[-3:].any()
     mandatory = dc_cond or bb_cond
@@ -493,9 +456,7 @@ def check_daily_condition(df):
     optional_count = sum([vr_cond, bw_cond, macd_cond])
     
     if mandatory and (optional_count >= 2):
-        # [변경] 스퀴즈는 위에서 계산한 20일 기준값 가져옴
         squeeze_on = df['TTM_Squeeze'].iloc[-5:].any()
-        
         win_52 = df.iloc[-252:]
         high_52_date = win_52['Close'].idxmax().strftime('%Y-%m-%d')
         prev_win = win_52[win_52.index < win_52['Close'].idxmax()]
@@ -510,7 +471,7 @@ def check_daily_condition(df):
             'diff_days': diff_days, 
             'bw_curr': curr['BW50'], 
             'macdv': curr['MACD_V'], 
-            'squeeze': "🔥TTM Squeeze" if squeeze_on else "-" # 20일 기준
+            'squeeze': "🔥TTM Squeeze" if squeeze_on else "-" 
         }
     return False, None
 
@@ -553,45 +514,30 @@ def check_monthly_condition(df):
         return True, {'price': curr_price, 'ath_price': ath_price, 'ath_date': ath_idx.strftime('%Y-%m'), 'month_count': month_count}
     return False, None
 
-# -----------------------------------------------------------------------------
-# [수정됨] 공용 모멘텀 분석 함수 (섹터/국가)
-# -----------------------------------------------------------------------------
 def analyze_momentum_strategy(target_list, type_name="ETF"):
     if not target_list: return pd.DataFrame()
     st.write(f"📊 총 {len(target_list)}개 {type_name} 분석 중...")
-    
     results = []; pbar = st.progress(0)
     for i, (t, n) in enumerate(target_list):
         pbar.progress((i+1)/len(target_list))
         rt, df = smart_download(t, "1d", "2y")
         if len(df)<30: continue
-        
         df = calculate_daily_indicators(df)
         if df is None: continue
-        
         c = df['Close']; curr=c.iloc[-1]
-        
-        # [변경] 스퀴즈: 20일 기준
         squeeze_on = df['TTM_Squeeze'].iloc[-5:].any() if 'TTM_Squeeze' in df.columns else False
-        
-        # [유지] 화면 표시용 보조 지표들은 기존대로 50일 기준 유지 (원복)
         ema20=c.ewm(span=20).mean(); ema50=c.ewm(span=50).mean(); ema60=c.ewm(span=60).mean()
         ema100=c.ewm(span=100).mean(); ema200=c.ewm(span=200).mean()
-        
-        bb_up = df['BB50_UP']; dc_h = df['Donchian_High_50'] # 50일 유지
+        bb_up = df['BB50_UP']; dc_h = df['Donchian_High_50'] 
         macdv = df['MACD_V']; atr = df['ATR14'].iloc[-1]
-        
         bb_bk = "O" if (c>bb_up).iloc[-3:].any() else "-"
         dc_bk = "O" if (c>dc_h).iloc[-3:].any() else "-"
         align = "⭐ 정배열" if (curr>ema20.iloc[-1] and curr>ema60.iloc[-1] and curr>ema100.iloc[-1] and curr>ema200.iloc[-1]) else "-"
         long_tr = "📈 상승" if (ema60.iloc[-1]>ema100.iloc[-1]>ema200.iloc[-1]) else "-"
-        
-        # [유지] 모멘텀 스코어 C안: (12M - 3M) + 1M
         r12 = c.pct_change(252).iloc[-1] if len(c) > 252 else 0
         r3 = c.pct_change(63).iloc[-1] if len(c) > 63 else 0
         r1 = c.pct_change(21).iloc[-1] if len(c) > 21 else 0
         score = ((r12 - r3) + r1) * 100
-        
         if len(df) >= 252:
             win_52 = df.iloc[-252:]
             high_idx = win_52['Close'].idxmax()
@@ -605,13 +551,12 @@ def analyze_momentum_strategy(target_list, type_name="ETF"):
                 prev_date = "-"; diff_days = 0
         else:
             high_52_date = "-"; prev_date = "-"; diff_days = 0
-        
         results.append({
             f"{type_name}": f"{rt} ({n})", 
             "모멘텀점수": score, 
-            "스퀴즈": "🔥" if squeeze_on else "-", # 컬럼명 '스퀴즈'로 통일 (20일 기준)
-            "BB(50,2)돌파": bb_bk, # 50일 유지
-            "돈키언(50)돌파": dc_bk, # 50일 유지
+            "스퀴즈": "🔥" if squeeze_on else "-", 
+            "BB(50,2)돌파": bb_bk, 
+            "돈키언(50)돌파": dc_bk, 
             "정배열": align, 
             "장기추세": long_tr, 
             "MACD-V": f"{macdv.iloc[-1]:.2f}", 
@@ -621,7 +566,6 @@ def analyze_momentum_strategy(target_list, type_name="ETF"):
             "차이일": f"{diff_days}일",
             "현재가": curr
         })
-        
     pbar.empty()
     if results:
         df_res = pd.DataFrame(results).sort_values("모멘텀점수", ascending=False)
@@ -630,61 +574,105 @@ def analyze_momentum_strategy(target_list, type_name="ETF"):
         return df_res
     return pd.DataFrame()
 
+# -----------------------------------------------------------------------------
+# [수정됨] 컵앤핸들 - 키포인트 로직 (느슨한 버전)
+# -----------------------------------------------------------------------------
 def check_cup_handle_pattern(df):
-    if len(df)<70: return False, None
-    df['SMA30']=df['Close'].rolling(30).mean(); curr=df.iloc[-1]; prev=df.iloc[-2]
-    if curr['Close']<=curr['SMA30'] or curr['SMA30']<=prev['SMA30']: return False, "추세약함"
-    sub = df.iloc[-75:]
-    r_win = sub.iloc[-15:-1]; 
-    if len(r_win)==0: return False, "데이터부족"
-    r_peak = r_win['High'].max(); r_idx = r_win['High'].idxmax()
-    l_area = sub[sub.index < r_idx].iloc[:-7]
-    if len(l_area)==0: return False, "좌측고점없음"
-    l_peak = l_area['High'].max(); l_idx = l_area['High'].idxmax()
-    if not (0.9*l_peak <= r_peak <= 1.1*l_peak): return False, "고점불일치"
-    cup = sub[(sub.index>l_idx)&(sub.index<r_idx)]
-    if len(cup)==0: return False, "컵바닥없음"
-    bot = cup['Low'].min(); depth = (l_peak-bot)/l_peak
-    if not (0.15<=depth<=0.50): return False, "깊이부적절"
-    h_area = df[df.index>r_idx]; h_w = len(h_area)
-    if h_w>10: return False, "핸들길어짐"
-    if curr['Close']<=r_peak: return False, "미돌파"
-    return True, {"depth":f"{depth*100:.1f}%", "handle_weeks":f"{h_w}주", "pivot":f"{r_peak:,.0f}"}
+    if len(df) < 26: return False, None # 최소 26주 (6개월) 데이터 필요
+    
+    # 최근 6개월(26주) 데이터만 사용
+    sub = df.iloc[-26:].copy()
+    if len(sub) < 26: return False, None
+    
+    # 1. Point A (좌측 입구): 전체 기간 중 최고점
+    idx_A = sub['High'].idxmax()
+    val_A = sub.loc[idx_A, 'High']
+    
+    # A가 너무 최근이면(오른쪽 끝) 컵 모양 아님
+    if idx_A == sub.index[-1]: return False, "A가 끝점"
+    
+    # 2. Point B (컵 바닥): A 이후 최저점
+    after_A = sub.loc[idx_A:]
+    if len(after_A) < 5: return False, "기간 짧음" # A 이후 데이터 너무 적음
+    
+    idx_B = after_A['Low'].idxmin()
+    val_B = after_A.loc[idx_B, 'Low']
+    
+    # 조건: B는 A보다 확실히 낮아야 함 (최소 15% 하락)
+    if val_B > val_A * 0.85: return False, "깊이 얕음"
+    
+    # 3. Point C (우측 입구 - 회복): B 이후 최고점
+    after_B = sub.loc[idx_B:]
+    if len(after_B) < 2: return False, "반등 짧음"
+    
+    idx_C = after_B['High'].idxmax()
+    val_C = after_B.loc[idx_C, 'High']
+    
+    # 조건: C는 A 높이의 85% 이상 회복해야 함
+    if val_C < val_A * 0.85: return False, "회복 미달"
+    
+    # 4. Point D (핸들 - 현재): C 이후 현재가 위치
+    # 현재가(Close)가 B(바닥)보다는 높아야 함 (눌림목)
+    curr_close = df['Close'].iloc[-1]
+    
+    if curr_close < val_B: return False, "핸들 붕괴"
+    
+    # 현재가가 C 근처(핸들)에 있거나 돌파했는지 확인
+    # 너무 많이 빠졌으면(C 대비 20% 이상 하락) 실패로 간주
+    if curr_close < val_C * 0.80: return False, "핸들 깊음"
 
+    return True, {
+        "depth": f"{(1 - val_B/val_A)*100:.1f}%", 
+        "handle_weeks": f"{len(df.loc[idx_C:])}주", 
+        "pivot": f"{val_C:,.0f}"
+    }
+
+# -----------------------------------------------------------------------------
+# [수정됨] 역헤드앤숄더 - 키포인트 로직 (느슨한 버전)
+# -----------------------------------------------------------------------------
 def check_inverse_hs_pattern(df):
-    if len(df)<50: return False, None
-    p = df['Close'].values; p_idx, t_idx = find_extrema(df, 3)
-    if len(t_idx)<3: return False, "저점부족"
-    for i in range(len(t_idx)-3, len(t_idx)-1):
-        if i<0: continue
-        ls=t_idx[i]; h=t_idx[i+1]; rs=t_idx[i+2]
-        if (len(p)-rs)>20: continue
-        if not (p[h]<p[ls] and p[h]<p[rs]): continue
-        if abs(p[ls]-p[rs])/((p[ls]+p[rs])/2)>0.15: continue
-        neck1 = np.max(p[ls:h]); neck2 = np.max(p[h:rs])
-        neck_idx1 = ls + np.argmax(p[ls:h]); neck_idx2 = h + np.argmax(p[h:rs])
-        if neck_idx2==neck_idx1: continue
-        slope = (neck2-neck1)/(neck_idx2-neck_idx1); inter = neck1-(slope*neck_idx1)
-        proj = slope*(len(p)-1)+inter
-        if p[-1]>proj:
-            vol_avg=df['Volume'].iloc[-20:].mean(); curr_vol=df['Volume'].iloc[-1]
-            return True, {"Neckline":f"{proj:,.0f}", "Breakout":"Yes", "Vol_Ratio":f"{curr_vol/vol_avg:.1f}배"}
-    return False, None
-
-def check_pullback_pattern(df):
-    if len(df) < 60: return False, None
-    df['EMA60'] = df['Close'].ewm(span=60).mean()
-    df['EMA20'] = df['Close'].ewm(span=20).mean()
-    df['VolSMA20'] = df['Volume'].rolling(20).mean()
-    curr = df.iloc[-1]
-    if curr['Close'] < curr['EMA60']: return False, "추세 이탈"
-    recent_high = df['High'].iloc[-10:].max()
-    if curr['Close'] > (recent_high * 0.97): return False, "고점"
-    dist = (curr['Close'] - curr['EMA20']) / curr['EMA20']
-    if dist < -0.03: return False, "지지선 붕괴"
-    if dist > 0.08: return False, "이격도 큼"
-    if curr['Volume'] > curr['VolSMA20']: return False, "매도세"
-    return True, {"pattern": "20일선 눌림목", "support": "EMA20"}
+    if len(df) < 60: return False, None # 최소 60주 데이터 필요
+    
+    # 최근 60주 데이터를 3등분 (각 20주)
+    window = 60
+    sub = df.iloc[-window:].copy()
+    
+    if len(sub) < 60: return False, None
+    
+    part1 = sub.iloc[:20]   # 좌측 구역
+    part2 = sub.iloc[20:40] # 중앙 구역
+    part3 = sub.iloc[40:]   # 우측 구역
+    
+    # 1. 각 구역의 최저점(Min) 찾기
+    min_L = part1['Low'].min()
+    min_H = part2['Low'].min()
+    min_R = part3['Low'].min()
+    
+    # 2. 핵심 조건: 가운데(Head)가 가장 낮아야 함 (V자 형태)
+    if not (min_H < min_L and min_H < min_R):
+        return False, "머리 미형성"
+        
+    # 3. 우측 어깨(R)가 머리(H)보다 높아야 함 (상승 저점 확인) -> 이미 위에서 min_H < min_R로 체크됨
+    
+    # 4. 넥라인 돌파 여부 (추세 전환 확인)
+    # 우측 어깨 구역의 최고점(고가)을 현재가가 위협하거나 돌파했는지
+    max_R = part3['High'].max()
+    curr_close = df['Close'].iloc[-1]
+    
+    # 너무 바닥에 있으면 안됨 (적어도 우측 어깨 저점보다는 꽤 올라와야 함)
+    if curr_close < min_R * 1.05: return False, "반등 약함"
+    
+    # 거래량 확인 (최근 3주 평균 거래량이 그 전보다 늘었는지)
+    vol_recent = part3['Volume'].mean()
+    vol_prev = part2['Volume'].mean()
+    
+    vol_ratio = vol_recent / vol_prev if vol_prev > 0 else 1.0
+    
+    return True, {
+        "Neckline": f"{max_R:,.0f}", 
+        "Breakout": "Ready" if curr_close < max_R else "Yes", 
+        "Vol_Ratio": f"{vol_ratio:.1f}배"
+    }
 
 # ==========================================
 # 5. 메인 실행 화면
@@ -720,7 +708,6 @@ with tab1:
                 st.dataframe(res, use_container_width=True)
             else: st.warning("데이터 부족")
 
-    # [NEW] VCP 버튼 추가
     if cols[2].button("🌪️ VCP"):
         tickers = get_tickers_from_sheet()
         if not tickers:
@@ -731,17 +718,13 @@ with tab1:
             for i, t in enumerate(tickers):
                 bar.progress((i+1)/len(tickers))
                 rt, df = smart_download(t, "1d", "2y")
-                
-                # VCP 체크 함수 호출
                 passed, info = check_vcp_pattern(df)
-                
                 if passed:
                     eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
                     sector = get_stock_sector(rt)
-                    
                     res.append({
                         '종목코드': rt, '섹터': sector, '현재가': f"{info['price']:,.0f}",
-                        '비고': info['status'], # 3단계 or 4단계
+                        '비고': info['status'], 
                         '손절가': f"{info['stop_loss']:,.0f}", 
                         '목표가(3R)': f"{info['target_price']:,.0f}",
                         '스퀴즈': info['squeeze'],
@@ -750,7 +733,6 @@ with tab1:
             bar.empty()
             if res:
                 st.success(f"[VCP] {len(res)}개 유망 종목 발견!")
-                # 상태별 정렬 (돌파 -> 수렴 순)
                 df_res = pd.DataFrame(res).sort_values("비고", ascending=True)
                 st.dataframe(df_res, use_container_width=True)
                 save_to_supabase(res, "VCP_Pattern")

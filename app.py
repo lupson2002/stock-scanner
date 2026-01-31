@@ -377,6 +377,91 @@ def calculate_daily_indicators(df):
     return df
 
 # -----------------------------------------------------------------------------
+# [NEW] VCP 패턴 확인 로직 (Minervini)
+# -----------------------------------------------------------------------------
+def check_vcp_pattern(df):
+    if len(df) < 250: return False, None
+    df = calculate_daily_indicators(df) # 스퀴즈 확인용
+    if df is None: return False, None
+    
+    # 1단계: 추세 템플릿 (Trend Template) 확인
+    curr = df.iloc[-1]
+    sma50 = df['Close'].rolling(50).mean().iloc[-1]
+    sma150 = df['Close'].rolling(150).mean().iloc[-1]
+    sma200 = df['Close'].rolling(200).mean().iloc[-1]
+    
+    # 1-1. 주가 > 150일, 200일선
+    cond1 = curr['Close'] > sma150 and curr['Close'] > sma200
+    # 1-2. 150일선 > 200일선
+    cond2 = sma150 > sma200
+    # 1-3. 200일선 상승 추세 (최근 1달)
+    cond3 = df['SMA20'].iloc[-1] > df['SMA20'].iloc[-20] # 200일은 너무 느리니 대략적 추세 확인
+    # 1-4. 50일선 > 150일선 (정배열)
+    cond4 = sma50 > sma150
+    # 1-5. 52주 신저가 대비 25% 이상 상승
+    low_52 = df['Low'].iloc[-252:].min()
+    cond5 = curr['Close'] > low_52 * 1.25
+    # 1-6. 52주 신고가 대비 25% 이내 (근처)
+    high_52 = df['High'].iloc[-252:].max()
+    cond6 = curr['Close'] > high_52 * 0.75
+    
+    stage_1_pass = cond1 and cond2 and cond4 and cond5 and cond6
+    if not stage_1_pass: return False, None # 추세 없으면 탈락
+
+    # 2단계: 변동성 축소 확인 (Contraction)
+    # 최근 60일(3달) 간의 고점/저점 파동 확인
+    window = 60
+    subset = df.iloc[-window:]
+    
+    # 간략화: 기간을 3등분하여 변동폭 계산
+    p1 = subset.iloc[:20]
+    p2 = subset.iloc[20:40]
+    p3 = subset.iloc[40:]
+    
+    range1 = (p1['High'].max() - p1['Low'].min()) / p1['High'].max()
+    range2 = (p2['High'].max() - p2['Low'].min()) / p2['High'].max()
+    range3 = (p3['High'].max() - p3['Low'].min()) / p3['High'].max()
+    
+    # 변동성이 줄어드는 경향 (완벽하지 않아도 됨)
+    contraction = (range3 < range2) or (range2 < range1) or (range3 < 0.10) # 마지막이 10% 이내면 OK
+    
+    if not contraction: return False, None
+
+    # 3단계: 마지막 수렴 및 거래량 감소 (Setup)
+    last_vol_avg = p3['Volume'].mean()
+    prev_vol_avg = p1['Volume'].mean()
+    vol_dry_up = last_vol_avg < prev_vol_avg # 거래량 감소
+    tight_area = range3 < 0.12 # 마지막 변동폭 12% 이내
+    
+    stage_3_pass = vol_dry_up and tight_area
+    
+    # 손절가: 마지막 구간 저점
+    stop_loss = p3['Low'].min()
+    # 목표가: 리스크(진입가-손절가)의 3배
+    risk = curr['Close'] - stop_loss
+    target_price = curr['Close'] + (risk * 3) if risk > 0 else 0
+    
+    # 4단계: 돌파 (Breakout)
+    pivot_point = p3['High'].max()
+    breakout = (curr['Close'] > pivot_point) and (curr['Volume'] > df['Volume'].iloc[-20:].mean() * 1.2) # 거래량 실린 돌파
+    
+    status = ""
+    if stage_3_pass and not breakout:
+        status = "3단계 (수렴중)"
+    elif stage_3_pass and breakout:
+        status = "4단계 (돌파!🚀)"
+    else:
+        return False, None # 2단계까지만 된 경우 제외 (너무 많음)
+
+    return True, {
+        'status': status,
+        'stop_loss': stop_loss,
+        'target_price': target_price,
+        'squeeze': "🔥" if df['TTM_Squeeze'].iloc[-1] else "-",
+        'price': curr['Close']
+    }
+
+# -----------------------------------------------------------------------------
 # 일봉 조건 체크: 50일 지표 사용 (전략 유지), 스퀴즈는 20일값 사용
 # -----------------------------------------------------------------------------
 def check_daily_condition(df):
@@ -599,7 +684,7 @@ if not supabase: st.warning("⚠️ DB 연결 키 오류")
 tab1, tab2, tab3, tab4 = st.tabs(["📊 신규 종목 발굴", "📉 저장된 종목 눌림목 찾기", "💰 재무분석", "📂 엑셀 데이터 매칭"])
 
 with tab1:
-    cols = st.columns(11) 
+    cols = st.columns(12) 
     
     if cols[0].button("🌍 섹터"):
         etfs = get_etfs_from_sheet()
@@ -623,7 +708,43 @@ with tab1:
                 st.dataframe(res, use_container_width=True)
             else: st.warning("데이터 부족")
 
-    if cols[2].button("🚀 일봉"):
+    # [NEW] VCP 버튼 추가
+    if cols[2].button("🌪️ VCP"):
+        tickers = get_tickers_from_sheet()
+        if not tickers:
+            st.warning("종목 리스트(TGT) 없음")
+        else:
+            st.info(f"[VCP 패턴] {len(tickers)}개 종목 정밀 분석 중... (추세 -> 수렴 -> 돌파)")
+            bar = st.progress(0); res = []
+            for i, t in enumerate(tickers):
+                bar.progress((i+1)/len(tickers))
+                rt, df = smart_download(t, "1d", "2y")
+                
+                # VCP 체크 함수 호출
+                passed, info = check_vcp_pattern(df)
+                
+                if passed:
+                    eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
+                    sector = get_stock_sector(rt)
+                    
+                    res.append({
+                        '종목코드': rt, '섹터': sector, '현재가': f"{info['price']:,.0f}",
+                        '비고': info['status'], # 3단계 or 4단계
+                        '손절가': f"{info['stop_loss']:,.0f}", 
+                        '목표가(3R)': f"{info['target_price']:,.0f}",
+                        '스퀴즈': info['squeeze'],
+                        '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m
+                    })
+            bar.empty()
+            if res:
+                st.success(f"[VCP] {len(res)}개 유망 종목 발견!")
+                # 상태별 정렬 (돌파 -> 수렴 순)
+                df_res = pd.DataFrame(res).sort_values("비고", ascending=True)
+                st.dataframe(df_res, use_container_width=True)
+                save_to_supabase(res, "VCP_Pattern")
+            else: st.warning("VCP 조건(추세+수렴)을 만족하는 종목이 없습니다.")
+
+    if cols[3].button("🚀 일봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info(f"[일봉 5-Factor + TTM Squeeze 20일] {len(tickers)}개 분석 시작...")
@@ -650,7 +771,7 @@ with tab1:
                 save_to_supabase(res, "Daily_5Factor")
             else: st.warning("조건 만족 없음")
 
-    if cols[3].button("📅 주봉"):
+    if cols[4].button("📅 주봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info(f"[주봉: BB돌파 or MACD매수] {len(tickers)}개 분석 시작...")
@@ -676,7 +797,7 @@ with tab1:
                 save_to_supabase(res, "Weekly")
             else: st.warning("조건 만족 없음")
 
-    if cols[4].button("🗓️ 월봉"):
+    if cols[5].button("🗓️ 월봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info(f"[월봉 ATH] {len(tickers)}개 분석 시작...")
@@ -702,7 +823,7 @@ with tab1:
                 save_to_supabase(res, "Monthly_ATH")
             else: st.warning("조건 만족 없음")
 
-    if cols[5].button("일+월봉"):
+    if cols[6].button("일+월봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info("일봉(5-Factor) + 월봉(ATH) 교차 분석 중...")
@@ -732,7 +853,7 @@ with tab1:
                 save_to_supabase(res, "Daily_Monthly")
             else: st.warning("조건 만족 없음")
 
-    if cols[6].button("일+주봉"):
+    if cols[7].button("일+주봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info("일봉(5-Factor) + 주봉(BB/MACD) 교차 분석 중...")
@@ -761,7 +882,7 @@ with tab1:
                 save_to_supabase(res, "Daily_Weekly")
             else: st.warning("조건 만족 없음")
 
-    if cols[7].button("주+월봉"):
+    if cols[8].button("주+월봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info("주봉(BB/MACD) + 월봉(ATH) 교차 분석 중...")
@@ -790,7 +911,7 @@ with tab1:
                 save_to_supabase(res, "Weekly_Monthly")
             else: st.warning("조건 만족 없음")
 
-    if cols[8].button("⚡ 통합"):
+    if cols[9].button("⚡ 통합"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info("[통합] 일+주+월봉 모두 만족하는 종목 검색 중...")
@@ -825,7 +946,7 @@ with tab1:
                 save_to_supabase(res, "Integrated_Triple")
             else: st.warning("3가지 조건을 모두 만족하는 종목이 없습니다.")
 
-    if cols[9].button("🏆 컵핸들"):
+    if cols[10].button("🏆 컵핸들"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info("[컵핸들] 분석 중...")
@@ -852,7 +973,7 @@ with tab1:
                 save_to_supabase(res, "CupHandle")
             else: st.warning("조건 만족 없음")
 
-    if cols[10].button("👤 역H&S"):
+    if cols[11].button("👤 역H&S"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info("[역H&S] 분석 중...")

@@ -282,7 +282,7 @@ def calculate_macdv(df, short=12, long=26, signal=9):
     return macd_v, macd_v_signal
 
 def calculate_common_indicators(df, is_weekly=False):
-    if len(df) < 100: return None
+    if len(df) < 60: return None # 주봉 기준 최소 데이터
     df = df.copy()
     period = 20 if is_weekly else 60
     
@@ -951,6 +951,7 @@ with tab1:
                 pass_c, info = check_cup_handle_pattern(df)
                 if pass_c:
                     df = calculate_common_indicators(df, True)
+                    if df is None: continue 
                     curr = df.iloc[-1]
                     sector = get_stock_sector(rt)
                     eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
@@ -978,6 +979,7 @@ with tab1:
                 pass_h, info = check_inverse_hs_pattern(df)
                 if pass_h:
                     df = calculate_common_indicators(df, True)
+                    if df is None: continue 
                     curr = df.iloc[-1]
                     sector = get_stock_sector(rt)
                     eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)

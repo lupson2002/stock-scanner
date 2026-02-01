@@ -155,29 +155,47 @@ def smart_download(ticker, interval="1d", period="2y"):
             continue
     return ticker, pd.DataFrame()
 
-def get_stock_sector(ticker):
+# [중요] 종목 정보 캐싱 (속도 및 안정성 향상)
+@st.cache_data(ttl=3600*24) # 24시간 동안 캐시 유지
+def get_ticker_info_safe(ticker):
+    """
+    yfinance의 info 호출을 안전하게 수행하고 캐싱합니다.
+    """
     try:
         tick = yf.Ticker(ticker)
-        info = tick.info
-        quote_type = info.get('quoteType', '').upper()
-        if 'ETF' in quote_type or 'FUND' in quote_type:
-            name = info.get('shortName', '')
-            if not name: name = info.get('longName', 'ETF')
-            return f"[ETF] {name}"
-        sector = info.get('sector', '')
-        if not sector: sector = info.get('industry', '')
-        if not sector: sector = info.get('shortName', '')
-        if not sector: return "Unknown"
-        translations = {
-            'Technology': '기술', 'Healthcare': '헬스케어', 'Financial Services': '금융',
-            'Consumer Cyclical': '임의소비재', 'Industrials': '산업재', 'Basic Materials': '소재',
-            'Energy': '에너지', 'Utilities': '유틸리티', 'Real Estate': '부동산',
-            'Communication Services': '통신', 'Consumer Defensive': '필수소비재',
-            'Semiconductors': '반도체'
-        }
-        return translations.get(sector, sector)
+        # 네트워크 에러 대비 3회 재시도
+        for _ in range(3):
+            try:
+                meta = tick.info
+                if meta: return meta
+            except:
+                time.sleep(0.5)
+        return None
     except:
-        return "Unknown"
+        return None
+
+def get_stock_sector(ticker):
+    meta = get_ticker_info_safe(ticker)
+    if not meta: return "Unknown"
+    
+    quote_type = meta.get('quoteType', '').upper()
+    if 'ETF' in quote_type or 'FUND' in quote_type:
+        name = meta.get('shortName', '')
+        if not name: name = meta.get('longName', 'ETF')
+        return f"[ETF] {name}"
+    
+    sector = meta.get('sector', '')
+    if not sector: sector = meta.get('industry', '')
+    if not sector: sector = meta.get('shortName', '')
+    
+    translations = {
+        'Technology': '기술', 'Healthcare': '헬스케어', 'Financial Services': '금융',
+        'Consumer Cyclical': '임의소비재', 'Industrials': '산업재', 'Basic Materials': '소재',
+        'Energy': '에너지', 'Utilities': '유틸리티', 'Real Estate': '부동산',
+        'Communication Services': '통신', 'Consumer Defensive': '필수소비재',
+        'Semiconductors': '반도체'
+    }
+    return translations.get(sector, sector)
 
 def save_to_supabase(data_list, strategy_name):
     if not supabase:
@@ -802,37 +820,30 @@ with tab3:
             for i, t in enumerate(tickers):
                 bar.progress((i+1)/len(tickers))
                 
-                # 1. 종목 유형 확인 (개별주 여부)
-                is_equity = False
-                final_ticker = None
-                final_info = None
-                
+                # 1. 종목 유형 확인 (개별주 여부) - 안전한 캐시 함수 사용
                 t_clean = t.strip()
                 candidates = [t_clean]
                 if t_clean.isdigit() and len(t_clean) == 6:
                     candidates = [f"{t_clean}.KS", f"{t_clean}.KQ"] 
                 
-                for cand in candidates:
-                    try:
-                        tick = yf.Ticker(cand)
-                        meta = tick.info
-                        if not meta: continue
-                        
-                        q_type = meta.get('quoteType', '').upper()
-                        
-                        if q_type == 'EQUITY':
-                            is_equity = True
-                            final_ticker = cand
-                            final_info = meta
-                            break
-                        elif 'ETF' in q_type or 'FUND' in q_type:
-                            is_equity = False
-                            break
-                    except:
-                        continue
+                final_ticker = None
+                final_info = None
                 
-                if not is_equity or not final_ticker:
-                    continue 
+                for cand in candidates:
+                    meta = get_ticker_info_safe(cand) # 안전한 함수 호출
+                    if not meta: continue
+                    
+                    q_type = meta.get('quoteType', '').upper()
+                    
+                    if q_type == 'EQUITY':
+                        final_ticker = cand
+                        final_info = meta
+                        break
+                    elif 'ETF' in q_type or 'FUND' in q_type:
+                        break # ETF/FUND는 스킵
+                
+                if not final_ticker:
+                    continue # 개별주 아님
                 
                 # 2. 데이터 다운로드
                 try:
@@ -878,7 +889,7 @@ with tab3:
             if res:
                 st.success(f"[VCP] {len(res)}개 유망 종목 발견!")
                 
-                # [수정] 4단계가 상단에 오도록 정렬
+                # [수정] 비고 열을 내림차순(ascending=False)으로 정렬하여 4단계가 위로 오게 함
                 df_res = pd.DataFrame(res).sort_values("비고", ascending=False)
                 st.dataframe(df_res, use_container_width=True)
                 

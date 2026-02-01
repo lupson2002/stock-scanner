@@ -789,7 +789,7 @@ with tab2:
 with tab3:
     cols = st.columns(12)
     
-    # [NEW] VCP 버튼 (차트 검증 + 정렬 수정 + 개별주 필터링)
+    # [NEW] VCP 버튼 (차트 검증 + 정렬 수정 + 개별주 필터링 + 2열 그리드 차트)
     if cols[0].button("🌪️ VCP"):
         tickers = get_tickers_from_sheet()
         if not tickers: st.warning("종목 리스트(TGT) 없음")
@@ -807,7 +807,6 @@ with tab3:
                 final_ticker = None
                 final_info = None
                 
-                # 티커 후보군 생성 (한국 주식 등 처리)
                 t_clean = t.strip()
                 candidates = [t_clean]
                 if t_clean.isdigit() and len(t_clean) == 6:
@@ -816,32 +815,28 @@ with tab3:
                 for cand in candidates:
                     try:
                         tick = yf.Ticker(cand)
-                        # info fetch allows us to check type
                         meta = tick.info
                         if not meta: continue
                         
                         q_type = meta.get('quoteType', '').upper()
                         
-                        # ETF/FUND 등 명시적 제외, EQUITY만 포함
                         if q_type == 'EQUITY':
                             is_equity = True
                             final_ticker = cand
                             final_info = meta
                             break
                         elif 'ETF' in q_type or 'FUND' in q_type:
-                            # ETF/FUND는 확인되었으므로 루프 중단하고 스킵
                             is_equity = False
                             break
                     except:
                         continue
                 
                 if not is_equity or not final_ticker:
-                    continue # 개별주가 아니거나 데이터를 못 찾음
+                    continue 
                 
-                # 2. 데이터 다운로드 (확정된 티커 사용)
+                # 2. 데이터 다운로드
                 try:
                     df = yf.download(final_ticker, period="2y", interval="1d", progress=False, auto_adjust=False)
-                    # MultiIndex 처리
                     if isinstance(df.columns, pd.MultiIndex):
                         df.columns = df.columns.get_level_values(0)
                 except:
@@ -854,12 +849,10 @@ with tab3:
                 if passed:
                     eps1w, eps1m, eps3m = get_eps_changes_from_db(final_ticker)
                     
-                    # 섹터 정보 (이미 final_info에 있으므로 재활용)
                     sector = final_info.get('sector', '')
                     if not sector: sector = final_info.get('industry', '')
                     if not sector: sector = final_info.get('shortName', 'Unknown')
                     
-                    # 한글 변환 (간단 버전)
                     translations = {
                         'Technology': '기술', 'Healthcare': '헬스케어', 'Financial Services': '금융',
                         'Consumer Cyclical': '임의소비재', 'Industrials': '산업재', 'Basic Materials': '소재',
@@ -884,20 +877,40 @@ with tab3:
             
             if res:
                 st.success(f"[VCP] {len(res)}개 유망 종목 발견!")
-                # [수정] 비고 열을 내림차순(ascending=False)으로 정렬하여 4단계가 위로 오게 함
+                
+                # [수정] 4단계가 상단에 오도록 정렬
                 df_res = pd.DataFrame(res).sort_values("비고", ascending=False)
                 st.dataframe(df_res, use_container_width=True)
                 
-                st.markdown("---")
-                st.markdown("### 👁️ 차트 검증 (Visual Verification)")
-                st.info("위 목록에서 종목을 선택하여 **피봇 포인트(빨간선)**와 **스탑로스(파란선)** 위치를 확인하세요.")
-                
-                selected_ticker = st.selectbox("종목 선택", df_res['종목코드'].tolist())
-                
-                if selected_ticker and selected_ticker in chart_data_cache:
-                    cached = chart_data_cache[selected_ticker]
-                    fig = plot_vcp_chart(cached['df'], selected_ticker, cached['info'])
-                    st.plotly_chart(fig, use_container_width=True)
+                # [NEW] 4단계 돌파 종목 자동 차트 갤러리 (2열 그리드)
+                breakout_targets = [r for r in res if "4단계" in r['비고']]
+
+                if breakout_targets:
+                    st.markdown("---")
+                    st.markdown("### 🚀 돌파 종목 차트 갤러리 (Step 4)")
+                    
+                    # 그리드 레이아웃 생성
+                    for i in range(0, len(breakout_targets), 2):
+                        c1, c2 = st.columns(2)
+                        
+                        # 왼쪽 차트
+                        item1 = breakout_targets[i]
+                        ticker1 = item1['종목코드']
+                        if ticker1 in chart_data_cache:
+                            cached1 = chart_data_cache[ticker1]
+                            fig1 = plot_vcp_chart(cached1['df'], ticker1, cached1['info'])
+                            c1.plotly_chart(fig1, use_container_width=True)
+                            c1.caption(f"**{ticker1}** ({item1['섹터']}) | 현재가: {item1['현재가']} | Pivot: {item1['Pivot']}")
+
+                        # 오른쪽 차트 (홀수 개일 경우 에러 방지)
+                        if i + 1 < len(breakout_targets):
+                            item2 = breakout_targets[i+1]
+                            ticker2 = item2['종목코드']
+                            if ticker2 in chart_data_cache:
+                                cached2 = chart_data_cache[ticker2]
+                                fig2 = plot_vcp_chart(cached2['df'], ticker2, cached2['info'])
+                                c2.plotly_chart(fig2, use_container_width=True)
+                                c2.caption(f"**{ticker2}** ({item2['섹터']}) | 현재가: {item2['현재가']} | Pivot: {item2['Pivot']}")
                 
                 save_to_supabase(res, "VCP_Pattern")
             else: st.warning("VCP 조건(추세+수렴)을 만족하는 종목이 없습니다.")

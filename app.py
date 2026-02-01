@@ -812,12 +812,23 @@ with tab3:
         tickers = get_tickers_from_sheet()
         if not tickers: st.warning("종목 리스트(TGT) 없음")
         else:
-            st.info(f"[VCP 패턴] {len(tickers)}개 종목 정밀 분석 중... (개별주만 필터링 + 120일 기준)")
-            bar = st.progress(0); res = []
+            st.info(f"구글 시트에서 총 **{len(tickers)}**개 종목을 불러왔습니다.")
             
-            chart_data_cache = {} 
+            # 진행상황 표시용
+            status_text = st.empty()
+            bar = st.progress(0)
+            
+            res = []
+            chart_data_cache = {}
+            
+            # 카운터 변수
+            count_total = len(tickers)
+            count_processed = 0
+            count_equity = 0
+            count_skipped = 0
             
             for i, t in enumerate(tickers):
+                status_text.text(f"⏳ 진행 중... ({i+1}/{count_total}) | 개별주식 발견: {count_equity}개 | 제외됨(ETF 등): {count_skipped}개")
                 bar.progress((i+1)/len(tickers))
                 
                 # 1. 종목 유형 확인 (개별주 여부) - 안전한 캐시 함수 사용
@@ -843,7 +854,11 @@ with tab3:
                         break # ETF/FUND는 스킵
                 
                 if not final_ticker:
-                    continue # 개별주 아님
+                    count_skipped += 1
+                    continue # 개별주 아님 -> 스킵
+                
+                # 개별주 확인됨
+                count_equity += 1
                 
                 # 2. 데이터 다운로드
                 try:
@@ -885,10 +900,12 @@ with tab3:
                         'Pivot': f"{info['pivot']:,.0f}" 
                     })
             bar.empty()
+            status_text.empty() # 진행 텍스트 지우기
+            
+            # 최종 리포트 출력
+            st.success(f"✅ 분석 완료! 총 {count_total}개 중 **개별주식 {count_equity}개**를 검사했습니다. (ETF/기타 {count_skipped}개 제외)")
             
             if res:
-                st.success(f"[VCP] {len(res)}개 유망 종목 발견!")
-                
                 # [수정] 비고 열을 내림차순(ascending=False)으로 정렬하여 4단계가 위로 오게 함
                 df_res = pd.DataFrame(res).sort_values("비고", ascending=False)
                 st.dataframe(df_res, use_container_width=True)

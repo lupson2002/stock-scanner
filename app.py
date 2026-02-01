@@ -633,30 +633,131 @@ def check_inverse_hs_pattern(df):
     vol_ratio = vol_recent / vol_prev if vol_prev > 0 else 1.0
     return True, {"Neckline": f"{max_R:,.0f}", "Breakout": "Ready" if curr_close < max_R else "Yes", "Vol_Ratio": f"{vol_ratio:.1f}배"}
 
-def check_pullback_pattern(df):
-    if len(df) < 60: return False, None
-    df['EMA60'] = df['Close'].ewm(span=60).mean()
-    df['EMA20'] = df['Close'].ewm(span=20).mean()
-    df['VolSMA20'] = df['Volume'].rolling(20).mean()
-    curr = df.iloc[-1]
-    if curr['Close'] < curr['EMA60']: return False, "추세 이탈"
-    recent_high = df['High'].iloc[-10:].max()
-    if curr['Close'] > (recent_high * 0.97): return False, "고점"
-    dist = (curr['Close'] - curr['EMA20']) / curr['EMA20']
-    if dist < -0.03: return False, "지지선 붕괴"
-    if dist > 0.08: return False, "이격도 큼"
-    if curr['Volume'] > curr['VolSMA20']: return False, "매도세"
-    return True, {"pattern": "20일선 눌림목", "support": "EMA20"}
+# -----------------------------------------------------------------------------
+# [NEW] 나침판용 전략 분석 함수 (최적화)
+# -----------------------------------------------------------------------------
+def get_compass_signal():
+    # 1. 설정
+    OFFENSE = ["QQQ", "SPY", "EFA", "GLD", "EEM"]
+    CASH = "BIL"
+    ALL_TICKERS = list(set(OFFENSE + [CASH]))
+    
+    # 2. 데이터 다운로드 (최근 2년치만)
+    try:
+        data = yf.download(ALL_TICKERS, period="2y", progress=False, auto_adjust=False)['Close']
+        if data.empty: return None, "데이터 없음"
+    except:
+        return None, "다운로드 실패"
+
+    # 3. 월봉 리샘플링
+    monthly_data = data.resample('ME').last()
+    
+    if len(monthly_data) < 13: return None, "데이터 부족 (최소 13개월 필요)"
+
+    # 4. 지표 계산 (마지막 시점 기준)
+    # pct_change는 (현재 - 과거) / 과거
+    m12 = monthly_data.pct_change(12).iloc[-1]
+    m6  = monthly_data.pct_change(6).iloc[-1]
+    m3  = monthly_data.pct_change(3).iloc[-1]
+    m1  = monthly_data.pct_change(1).iloc[-1]
+
+    # 5. 전략 3 (Smoothed) 스코어 계산
+    # 공식: ((12M + 6M) / 2 - 3M) + 1M
+    scores = {}
+    for ticker in OFFENSE:
+        if ticker not in m12.index: continue
+        
+        r12 = m12[ticker]
+        r6  = m6[ticker]
+        r3  = m3[ticker]
+        r1  = m1[ticker]
+        
+        # NaN 체크
+        if np.isnan(r12): continue
+        
+        avg_long = (r12 + r6) / 2
+        score = (avg_long - r3) + r1
+        scores[ticker] = {
+            "Score": score * 100,
+            "12M_Trend": r12 # 절대 모멘텀 확인용
+        }
+    
+    if not scores: return None, "계산 불가"
+
+    # 6. 순위 산정
+    df_scores = pd.DataFrame(scores).T
+    df_scores = df_scores.sort_values("Score", ascending=False)
+    
+    best_ticker = df_scores.index[0]
+    best_score = df_scores.iloc[0]['Score']
+    best_trend = df_scores.iloc[0]['12M_Trend']
+    
+    # 7. 포지션 결정 (절대 모멘텀 필터)
+    final_position = best_ticker if (best_score > 0 and best_trend > 0) else CASH
+    
+    return df_scores, final_position
 
 # ==========================================
 # 5. 메인 실행 화면
 # ==========================================
 
-tab1, tab2, tab3, tab4 = st.tabs(["📊 신규 종목 발굴", "📉 저장된 종목 눌림목 찾기", "💰 재무분석", "📂 엑셀 데이터 매칭"])
+# [변경] 탭 순서 변경: 나침판(tab_compass)을 맨 앞으로
+tab_compass, tab1, tab2, tab3, tab4, tab5 = st.tabs(["🧭 나침판", "🌍 섹터", "🏳️ 국가", "📊 기술적 분석", "💰 재무분석", "📂 엑셀 데이터 매칭"])
 
+# -----------------------------------------------------------------------------
+# [탭 1] 나침판 (가장 왼쪽으로 이동)
+# -----------------------------------------------------------------------------
+with tab_compass:
+    st.markdown("### 🧭 투자 나침판 (Smoothed Momentum Strategy)")
+    st.markdown("""
+    이 탭은 **'전략 3 (평균 모멘텀)'** 로직을 기반으로 **현재 시점(Today)**에서 가장 매력적인 자산을 알려줍니다.
+    
+    **전략 로직:**
+    1. **후보군:** QQQ(나스닥), SPY(S&P500), EFA(선진국), GLD(금), EEM(신흥국)
+    2. **점수 산출:** `((12개월+6개월)/2 - 3개월) + 1개월` 수익률
+    3. **방어 기제:** 1등 종목의 12개월 수익률이 마이너스면 **현금(BIL)** 보유
+    """)
+    
+    if st.button("🚀 지금 어디에 투자해야 할까? (분석 시작)", type="primary"):
+        with st.spinner("최근 2년치 데이터를 분석하여 방향을 잡는 중입니다..."):
+            df_result, position = get_compass_signal()
+            
+            if df_result is not None:
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.success(f"🎯 현재 추천 포지션: **{position}**")
+                    if position == "BIL":
+                        st.caption("🚨 시장 상황이 좋지 않습니다. 현금(초단기채)으로 대피하세요.")
+                    else:
+                        st.caption(f"🚀 상승 모멘텀이 가장 강한 **{position}**에 올라타세요!")
+                
+                with col2:
+                    top_score = df_result.iloc[0]['Score']
+                    st.metric("1등 모멘텀 점수", f"{top_score:.2f}점")
+
+                st.markdown("---")
+                st.markdown("#### 📊 자산별 상세 스코어 (높은 순)")
+                
+                df_display = df_result.copy()
+                df_display['Score'] = df_display['Score'].apply(lambda x: f"{x:.2f}")
+                df_display['12M_Trend'] = df_display['12M_Trend'].apply(lambda x: f"{x*100:.1f}%")
+                df_display.columns = ["모멘텀 점수", "12개월 추세(절대)"]
+                
+                st.dataframe(df_display, use_container_width=True)
+                
+                st.info("""
+                **해석 가이드:**
+                * **모멘텀 점수:** 높을수록 상승세가 견고하고 최근 눌림목을 잘 소화한 종목입니다.
+                * **12개월 추세:** 이 값이 마이너스(-)라면, 점수가 아무리 높아도 **하락장**으로 간주하여 현금(BIL)을 추천합니다.
+                """)
+            else:
+                st.error(f"분석 실패: {position}")
+
+# -----------------------------------------------------------------------------
+# [탭 2] 섹터 (두 번째로 이동)
+# -----------------------------------------------------------------------------
 with tab1:
     cols = st.columns(12) 
-    
     if cols[0].button("🌍 섹터"):
         etfs = get_etfs_from_sheet()
         if not etfs: st.warning("ETF 목록 없음")
@@ -666,7 +767,12 @@ with tab1:
             if not res.empty: st.dataframe(res, use_container_width=True)
             else: st.warning("데이터 부족")
 
-    if cols[1].button("🏳️ 국가"):
+# -----------------------------------------------------------------------------
+# [탭 3] 국가 (기존 위치 유지)
+# -----------------------------------------------------------------------------
+with tab2:
+    cols = st.columns(12)
+    if cols[0].button("🏳️ 국가"):
         tickers = get_country_etfs_from_sheet()
         if not tickers: st.warning("국가 ETF 목록 없음")
         else:
@@ -677,15 +783,20 @@ with tab1:
                 st.dataframe(res, use_container_width=True)
             else: st.warning("데이터 부족")
 
-    # [NEW] VCP 버튼 (차트 검증 기능 추가)
-    if cols[2].button("🌪️ VCP"):
+# -----------------------------------------------------------------------------
+# [탭 4] 기술적 분석 (VCP 포함)
+# -----------------------------------------------------------------------------
+with tab3:
+    cols = st.columns(12)
+    
+    # [NEW] VCP 버튼 (차트 검증 + 정렬 수정)
+    if cols[0].button("🌪️ VCP"):
         tickers = get_tickers_from_sheet()
         if not tickers: st.warning("종목 리스트(TGT) 없음")
         else:
             st.info(f"[VCP 패턴] {len(tickers)}개 종목 정밀 분석 중... (120일 기준)")
             bar = st.progress(0); res = []
             
-            # 차트 그리기용 데이터를 잠시 저장할 딕셔너리
             chart_data_cache = {} 
             
             for i, t in enumerate(tickers):
@@ -695,7 +806,6 @@ with tab1:
                 if passed:
                     eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
                     sector = get_stock_sector(rt)
-                    # 차트 그리기를 위해 데이터 캐싱
                     chart_data_cache[rt] = {'df': df, 'info': info}
                     
                     res.append({
@@ -705,16 +815,16 @@ with tab1:
                         '목표가(3R)': f"{info['target_price']:,.0f}",
                         '스퀴즈': info['squeeze'],
                         '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
-                        'Pivot': f"{info['pivot']:,.0f}" # 피봇 가격 표시
+                        'Pivot': f"{info['pivot']:,.0f}" 
                     })
             bar.empty()
             
             if res:
                 st.success(f"[VCP] {len(res)}개 유망 종목 발견!")
-                df_res = pd.DataFrame(res).sort_values("비고", ascending=True)
+                # [수정] 비고 열을 내림차순(ascending=False)으로 정렬하여 4단계가 위로 오게 함
+                df_res = pd.DataFrame(res).sort_values("비고", ascending=False)
                 st.dataframe(df_res, use_container_width=True)
                 
-                # [NEW] 차트 검증 섹션
                 st.markdown("---")
                 st.markdown("### 👁️ 차트 검증 (Visual Verification)")
                 st.info("위 목록에서 종목을 선택하여 **피봇 포인트(빨간선)**와 **스탑로스(파란선)** 위치를 확인하세요.")
@@ -729,7 +839,7 @@ with tab1:
                 save_to_supabase(res, "VCP_Pattern")
             else: st.warning("VCP 조건(추세+수렴)을 만족하는 종목이 없습니다.")
 
-    if cols[3].button("🚀 일봉"):
+    if cols[1].button("🚀 일봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info(f"[일봉 5-Factor] {len(tickers)}개 분석 시작...")
@@ -756,7 +866,7 @@ with tab1:
                 save_to_supabase(res, "Daily_5Factor")
             else: st.warning("조건 만족 없음")
 
-    if cols[4].button("📅 주봉"):
+    if cols[2].button("📅 주봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info(f"[주봉] {len(tickers)}개 분석 시작...")
@@ -782,7 +892,7 @@ with tab1:
                 save_to_supabase(res, "Weekly")
             else: st.warning("조건 만족 없음")
 
-    if cols[5].button("🗓️ 월봉"):
+    if cols[3].button("🗓️ 월봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info(f"[월봉] {len(tickers)}개 분석 시작...")
@@ -808,7 +918,7 @@ with tab1:
                 save_to_supabase(res, "Monthly_ATH")
             else: st.warning("조건 만족 없음")
 
-    if cols[6].button("일+월봉"):
+    if cols[4].button("일+월봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info("일봉+월봉 분석 중...")
@@ -838,7 +948,7 @@ with tab1:
                 save_to_supabase(res, "Daily_Monthly")
             else: st.warning("조건 만족 없음")
 
-    if cols[7].button("일+주봉"):
+    if cols[5].button("일+주봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info("일봉+주봉 분석 중...")
@@ -867,7 +977,7 @@ with tab1:
                 save_to_supabase(res, "Daily_Weekly")
             else: st.warning("조건 만족 없음")
 
-    if cols[8].button("주+월봉"):
+    if cols[6].button("주+월봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info("주봉+월봉 분석 중...")
@@ -896,7 +1006,7 @@ with tab1:
                 save_to_supabase(res, "Weekly_Monthly")
             else: st.warning("조건 만족 없음")
 
-    if cols[9].button("⚡ 통합"):
+    if cols[7].button("⚡ 통합"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info("통합(일+주+월) 분석 중...")
@@ -931,7 +1041,7 @@ with tab1:
                 save_to_supabase(res, "Integrated_Triple")
             else: st.warning("3가지 조건을 모두 만족하는 종목이 없습니다.")
 
-    if cols[10].button("🏆 컵핸들"):
+    if cols[8].button("🏆 컵핸들"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info("[컵핸들] 분석 중...")
@@ -959,7 +1069,7 @@ with tab1:
                 save_to_supabase(res, "CupHandle")
             else: st.warning("조건 만족 없음")
 
-    if cols[11].button("👤 역H&S"):
+    if cols[9].button("👤 역H&S"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info("[역H&S] 분석 중...")
@@ -987,7 +1097,6 @@ with tab1:
                 save_to_supabase(res, "InverseHS")
             else: st.warning("조건 만족 없음")
 
-with tab2:
     st.markdown("### 📉 저장된 종목 중 눌림목/급등주 찾기")
     if st.button("🔍 눌림목 & 급등 패턴 분석"):
         db_tickers = get_unique_tickers_from_db()
@@ -1021,7 +1130,7 @@ with tab2:
                 st.dataframe(pd.DataFrame(res), use_container_width=True)
             else: st.warning("조건 만족 없음")
 
-with tab3:
+with tab4:
     st.markdown("### 💰 재무 지표 분석 & EPS Trend (yfinance)")
     if st.button("📊 재무 지표 가져오기"):
         tickers = get_tickers_from_sheet()
@@ -1075,7 +1184,7 @@ with tab3:
                 st.dataframe(df_fin, use_container_width=True)
             else: st.warning("데이터를 가져오지 못했습니다.")
 
-with tab4:
+with tab5:
     st.markdown("### 📂 엑셀 데이터 매칭 (퀀티와이즈 DB 연동)")
     col_upload, col_reset = st.columns([3, 1])
     with col_upload:

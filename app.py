@@ -514,6 +514,9 @@ def check_monthly_condition(df):
         return True, {'price': curr_price, 'ath_price': ath_price, 'ath_date': ath_idx.strftime('%Y-%m'), 'month_count': month_count}
     return False, None
 
+# -----------------------------------------------------------------------------
+# [수정됨] 공용 모멘텀 분석 함수 (전략 3: 평균 모멘텀 적용)
+# -----------------------------------------------------------------------------
 def analyze_momentum_strategy(target_list, type_name="ETF"):
     if not target_list: return pd.DataFrame()
     st.write(f"📊 총 {len(target_list)}개 {type_name} 분석 중...")
@@ -534,10 +537,17 @@ def analyze_momentum_strategy(target_list, type_name="ETF"):
         dc_bk = "O" if (c>dc_h).iloc[-3:].any() else "-"
         align = "⭐ 정배열" if (curr>ema20.iloc[-1] and curr>ema60.iloc[-1] and curr>ema100.iloc[-1] and curr>ema200.iloc[-1]) else "-"
         long_tr = "📈 상승" if (ema60.iloc[-1]>ema100.iloc[-1]>ema200.iloc[-1]) else "-"
+        
+        # [변경] 전략 3: 평균 모멘텀 (Smoothed)
+        # 공식: ((12M + 6M) / 2 - 3M) + 1M
         r12 = c.pct_change(252).iloc[-1] if len(c) > 252 else 0
-        r3 = c.pct_change(63).iloc[-1] if len(c) > 63 else 0
-        r1 = c.pct_change(21).iloc[-1] if len(c) > 21 else 0
-        score = ((r12 - r3) + r1) * 100
+        r6  = c.pct_change(126).iloc[-1] if len(c) > 126 else 0
+        r3  = c.pct_change(63).iloc[-1] if len(c) > 63 else 0
+        r1  = c.pct_change(21).iloc[-1] if len(c) > 21 else 0
+        
+        avg_long_term = (r12 + r6) / 2
+        score = ((avg_long_term - r3) + r1) * 100
+        
         if len(df) >= 252:
             win_52 = df.iloc[-252:]
             high_idx = win_52['Close'].idxmax()

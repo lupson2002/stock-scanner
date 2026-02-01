@@ -789,27 +789,90 @@ with tab2:
 with tab3:
     cols = st.columns(12)
     
-    # [NEW] VCP 버튼 (차트 검증 + 정렬 수정)
+    # [NEW] VCP 버튼 (차트 검증 + 정렬 수정 + 개별주 필터링)
     if cols[0].button("🌪️ VCP"):
         tickers = get_tickers_from_sheet()
         if not tickers: st.warning("종목 리스트(TGT) 없음")
         else:
-            st.info(f"[VCP 패턴] {len(tickers)}개 종목 정밀 분석 중... (120일 기준)")
+            st.info(f"[VCP 패턴] {len(tickers)}개 종목 정밀 분석 중... (개별주만 필터링 + 120일 기준)")
             bar = st.progress(0); res = []
             
             chart_data_cache = {} 
             
             for i, t in enumerate(tickers):
                 bar.progress((i+1)/len(tickers))
-                rt, df = smart_download(t, "1d", "2y")
+                
+                # 1. 종목 유형 확인 (개별주 여부)
+                is_equity = False
+                final_ticker = None
+                final_info = None
+                
+                # 티커 후보군 생성 (한국 주식 등 처리)
+                t_clean = t.strip()
+                candidates = [t_clean]
+                if t_clean.isdigit() and len(t_clean) == 6:
+                    candidates = [f"{t_clean}.KS", f"{t_clean}.KQ"] 
+                
+                for cand in candidates:
+                    try:
+                        tick = yf.Ticker(cand)
+                        # info fetch allows us to check type
+                        meta = tick.info
+                        if not meta: continue
+                        
+                        q_type = meta.get('quoteType', '').upper()
+                        
+                        # ETF/FUND 등 명시적 제외, EQUITY만 포함
+                        if q_type == 'EQUITY':
+                            is_equity = True
+                            final_ticker = cand
+                            final_info = meta
+                            break
+                        elif 'ETF' in q_type or 'FUND' in q_type:
+                            # ETF/FUND는 확인되었으므로 루프 중단하고 스킵
+                            is_equity = False
+                            break
+                    except:
+                        continue
+                
+                if not is_equity or not final_ticker:
+                    continue # 개별주가 아니거나 데이터를 못 찾음
+                
+                # 2. 데이터 다운로드 (확정된 티커 사용)
+                try:
+                    df = yf.download(final_ticker, period="2y", interval="1d", progress=False, auto_adjust=False)
+                    # MultiIndex 처리
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.get_level_values(0)
+                except:
+                    continue
+
+                if len(df) < 250: continue
+
+                # 3. VCP 패턴 체크
                 passed, info = check_vcp_pattern(df)
                 if passed:
-                    eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
-                    sector = get_stock_sector(rt)
-                    chart_data_cache[rt] = {'df': df, 'info': info}
+                    eps1w, eps1m, eps3m = get_eps_changes_from_db(final_ticker)
+                    
+                    # 섹터 정보 (이미 final_info에 있으므로 재활용)
+                    sector = final_info.get('sector', '')
+                    if not sector: sector = final_info.get('industry', '')
+                    if not sector: sector = final_info.get('shortName', 'Unknown')
+                    
+                    # 한글 변환 (간단 버전)
+                    translations = {
+                        'Technology': '기술', 'Healthcare': '헬스케어', 'Financial Services': '금융',
+                        'Consumer Cyclical': '임의소비재', 'Industrials': '산업재', 'Basic Materials': '소재',
+                        'Energy': '에너지', 'Utilities': '유틸리티', 'Real Estate': '부동산',
+                        'Communication Services': '통신', 'Consumer Defensive': '필수소비재',
+                        'Semiconductors': '반도체'
+                    }
+                    sector_kr = translations.get(sector, sector)
+
+                    chart_data_cache[final_ticker] = {'df': df, 'info': info}
                     
                     res.append({
-                        '종목코드': rt, '섹터': sector, '현재가': f"{info['price']:,.0f}",
+                        '종목코드': final_ticker, '섹터': sector_kr, '현재가': f"{info['price']:,.0f}",
                         '비고': info['status'], 
                         '손절가': f"{info['stop_loss']:,.0f}", 
                         '목표가(3R)': f"{info['target_price']:,.0f}",

@@ -9,10 +9,15 @@ import time
 import re
 
 # =========================================================
-# [설정] Supabase 연결 정보
+# [설정] Supabase 연결 정보 (보안 적용)
 # =========================================================
-SUPABASE_URL = "https://sgpzmkfproftswevwybm.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNncHpta2Zwcm9mdHN3ZXZ3eWJtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjQ5OTQ0MDEsImV4cCI6MjA4MDU3MDQwMX0.VwStTHOr7_SqYrfwqol1E3ab89HsoUArV1q1s7UFAR4"
+try:
+    # Streamlit Secrets에서 가져오기
+    SUPABASE_URL = st.secrets["supabase"]["url"]
+    SUPABASE_KEY = st.secrets["supabase"]["key"]
+except Exception as e:
+    st.error(f"⚠️ Secrets 설정이 필요합니다. (에러: {e})")
+    st.stop()
 
 # ==========================================
 # 1. 페이지 설정 및 DB 연결
@@ -364,7 +369,7 @@ def calculate_daily_indicators(df):
     return df
 
 # -----------------------------------------------------------------------------
-# VCP 패턴 확인 로직 (Minervini)
+# [수정됨] VCP 패턴 확인 로직 (120일 / 40일 구간 기준)
 # -----------------------------------------------------------------------------
 def check_vcp_pattern(df):
     if len(df) < 250: return False, None
@@ -388,11 +393,11 @@ def check_vcp_pattern(df):
     stage_1_pass = cond1 and cond2 and cond4 and cond5 and cond6
     if not stage_1_pass: return False, None 
 
-    window = 60
+    window = 120 
     subset = df.iloc[-window:]
-    p1 = subset.iloc[:20]
-    p2 = subset.iloc[20:40]
-    p3 = subset.iloc[40:]
+    p1 = subset.iloc[:40]   
+    p2 = subset.iloc[40:80] 
+    p3 = subset.iloc[80:]   
     
     range1 = (p1['High'].max() - p1['Low'].min()) / p1['High'].max()
     range2 = (p2['High'].max() - p2['Low'].min()) / p2['High'].max()
@@ -418,8 +423,8 @@ def check_vcp_pattern(df):
     else:
         pivot_point = p3['High'].max() 
 
-    vol_ma20 = df['Volume'].iloc[-21:-1].mean() 
-    breakout = (curr['Close'] > pivot_point) and (curr['Volume'] > vol_ma20 * 1.2)
+    vol_ma50 = df['Volume'].iloc[-51:-1].mean()
+    breakout = (curr['Close'] > pivot_point) and (curr['Volume'] > vol_ma50 * 1.2)
     
     status = ""
     if stage_3_pass and not breakout:
@@ -585,50 +590,38 @@ def analyze_momentum_strategy(target_list, type_name="ETF"):
     return pd.DataFrame()
 
 # -----------------------------------------------------------------------------
-# [수정됨] 컵앤핸들 - 키포인트 로직 (느슨한 버전)
+# [수정됨] 컵앤핸들 - 키포인트 로직 (느슨한 버전 + 예외처리)
 # -----------------------------------------------------------------------------
 def check_cup_handle_pattern(df):
-    if len(df) < 26: return False, None # 최소 26주 (6개월) 데이터 필요
+    if len(df) < 26: return False, None 
     
-    # 최근 6개월(26주) 데이터만 사용
     sub = df.iloc[-26:].copy()
     if len(sub) < 26: return False, None
     
-    # 1. Point A (좌측 입구): 전체 기간 중 최고점
     idx_A = sub['High'].idxmax()
     val_A = sub.loc[idx_A, 'High']
     
-    # A가 너무 최근이면(오른쪽 끝) 컵 모양 아님
     if idx_A == sub.index[-1]: return False, "A가 끝점"
     
-    # 2. Point B (컵 바닥): A 이후 최저점
     after_A = sub.loc[idx_A:]
-    if len(after_A) < 5: return False, "기간 짧음" # A 이후 데이터 너무 적음
+    if len(after_A) < 5: return False, "기간 짧음" 
     
     idx_B = after_A['Low'].idxmin()
     val_B = after_A.loc[idx_B, 'Low']
     
-    # 조건: B는 A보다 확실히 낮아야 함 (최소 15% 하락)
     if val_B > val_A * 0.85: return False, "깊이 얕음"
     
-    # 3. Point C (우측 입구 - 회복): B 이후 최고점
     after_B = sub.loc[idx_B:]
     if len(after_B) < 2: return False, "반등 짧음"
     
     idx_C = after_B['High'].idxmax()
     val_C = after_B.loc[idx_C, 'High']
     
-    # 조건: C는 A 높이의 85% 이상 회복해야 함
     if val_C < val_A * 0.85: return False, "회복 미달"
     
-    # 4. Point D (핸들 - 현재): C 이후 현재가 위치
-    # 현재가(Close)가 B(바닥)보다는 높아야 함 (눌림목)
     curr_close = df['Close'].iloc[-1]
     
     if curr_close < val_B: return False, "핸들 붕괴"
-    
-    # 현재가가 C 근처(핸들)에 있거나 돌파했는지 확인
-    # 너무 많이 빠졌으면(C 대비 20% 이상 하락) 실패로 간주
     if curr_close < val_C * 0.80: return False, "핸들 깊음"
 
     return True, {
@@ -638,41 +631,32 @@ def check_cup_handle_pattern(df):
     }
 
 # -----------------------------------------------------------------------------
-# [수정됨] 역헤드앤숄더 - 키포인트 로직 (느슨한 버전)
+# [수정됨] 역헤드앤숄더 - 키포인트 로직 (느슨한 버전 + 예외처리)
 # -----------------------------------------------------------------------------
 def check_inverse_hs_pattern(df):
-    if len(df) < 60: return False, None # 최소 60주 데이터 필요
+    if len(df) < 60: return False, None 
     
-    # 최근 60주 데이터를 3등분 (각 20주)
     window = 60
     sub = df.iloc[-window:].copy()
     
     if len(sub) < 60: return False, None
     
-    part1 = sub.iloc[:20]   # 좌측 구역
-    part2 = sub.iloc[20:40] # 중앙 구역
-    part3 = sub.iloc[40:]   # 우측 구역
+    part1 = sub.iloc[:20]   
+    part2 = sub.iloc[20:40] 
+    part3 = sub.iloc[40:]   
     
-    # 1. 각 구역의 최저점(Min) 찾기
     min_L = part1['Low'].min()
     min_H = part2['Low'].min()
     min_R = part3['Low'].min()
     
-    # 2. 핵심 조건: 가운데(Head)가 가장 낮아야 함 (V자 형태)
     if not (min_H < min_L and min_H < min_R):
         return False, "머리 미형성"
         
-    # 3. 우측 어깨(R)가 머리(H)보다 높아야 함 (상승 저점 확인) -> 이미 위에서 min_H < min_R로 체크됨
-    
-    # 4. 넥라인 돌파 여부 (추세 전환 확인)
-    # 우측 어깨 구역의 최고점(고가)을 현재가가 위협하거나 돌파했는지
     max_R = part3['High'].max()
     curr_close = df['Close'].iloc[-1]
     
-    # 너무 바닥에 있으면 안됨 (적어도 우측 어깨 저점보다는 꽤 올라와야 함)
     if curr_close < min_R * 1.05: return False, "반등 약함"
     
-    # 거래량 확인 (최근 3주 평균 거래량이 그 전보다 늘었는지)
     vol_recent = part3['Volume'].mean()
     vol_prev = part2['Volume'].mean()
     
@@ -701,7 +685,7 @@ with tab1:
         if not etfs:
             st.warning("ETF 목록 없음")
         else:
-            st.info("ETF 섹터 분석 중 (모멘텀 C안)...")
+            st.info("ETF 섹터 분석 중 (모멘텀 전략 3: Smoothed)...")
             res = analyze_momentum_strategy(etfs, "ETF")
             if not res.empty: st.dataframe(res, use_container_width=True)
             else: st.warning("데이터 부족")
@@ -711,7 +695,7 @@ with tab1:
         if not tickers:
             st.warning("국가 ETF 목록 없음")
         else:
-            st.info(f"[국가 ETF] {len(tickers)}개 모멘텀(C안) 분석 시작...")
+            st.info(f"[국가 ETF] {len(tickers)}개 모멘텀(전략 3: Smoothed) 분석 시작...")
             res = analyze_momentum_strategy(tickers, "국가ETF")
             if not res.empty:
                 st.success(f"[국가] {len(res)}개 분석 완료!")
@@ -723,7 +707,7 @@ with tab1:
         if not tickers:
             st.warning("종목 리스트(TGT) 없음")
         else:
-            st.info(f"[VCP 패턴] {len(tickers)}개 종목 정밀 분석 중... (추세 -> 수렴 -> 돌파)")
+            st.info(f"[VCP 패턴] {len(tickers)}개 종목 정밀 분석 중... (120일 기준)")
             bar = st.progress(0); res = []
             for i, t in enumerate(tickers):
                 bar.progress((i+1)/len(tickers))

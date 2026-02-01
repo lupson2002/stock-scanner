@@ -6,4 +6,5 @@ supabase
 scipy
 openpyxl
 requests
+plotly
 

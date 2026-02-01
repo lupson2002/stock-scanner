@@ -155,15 +155,11 @@ def smart_download(ticker, interval="1d", period="2y"):
             continue
     return ticker, pd.DataFrame()
 
-# [중요] 종목 정보 캐싱 (속도 및 안정성 향상)
-@st.cache_data(ttl=3600*24) # 24시간 동안 캐시 유지
+# [중요] 종목 정보 캐싱 (섹터 정보 표시용으로만 사용)
+@st.cache_data(ttl=3600*24) 
 def get_ticker_info_safe(ticker):
-    """
-    yfinance의 info 호출을 안전하게 수행하고 캐싱합니다.
-    """
     try:
         tick = yf.Ticker(ticker)
-        # 네트워크 에러 대비 3회 재시도
         for _ in range(3):
             try:
                 meta = tick.info
@@ -807,7 +803,7 @@ with tab2:
 with tab3:
     cols = st.columns(12)
     
-    # [NEW] VCP 버튼 (차트 검증 + 정렬 수정 + 개별주 필터링 + 2열 그리드 차트)
+    # [NEW] VCP 버튼 (차트 검증 + 정렬 수정 + 개별주 필터링 삭제 + 2열 그리드 차트)
     if cols[0].button("🌪️ VCP"):
         tickers = get_tickers_from_sheet()
         if not tickers: st.warning("종목 리스트(TGT) 없음")
@@ -823,75 +819,35 @@ with tab3:
             
             # 카운터 변수
             count_total = len(tickers)
-            count_processed = 0
-            count_equity = 0
-            count_skipped = 0
             
             for i, t in enumerate(tickers):
-                status_text.text(f"⏳ 진행 중... ({i+1}/{count_total}) | 개별주식 발견: {count_equity}개 | 제외됨(ETF 등): {count_skipped}개")
+                status_text.text(f"⏳ 진행 중... ({i+1}/{count_total}) - {t}")
                 bar.progress((i+1)/len(tickers))
                 
-                # 1. 종목 유형 확인 (개별주 여부) - 안전한 캐시 함수 사용
+                # 1. 데이터 다운로드 (즉시 시도)
+                # 티커 클렌징 (공백 제거)
                 t_clean = t.strip()
-                candidates = [t_clean]
-                if t_clean.isdigit() and len(t_clean) == 6:
-                    candidates = [f"{t_clean}.KS", f"{t_clean}.KQ"] 
                 
-                final_ticker = None
-                final_info = None
-                
-                for cand in candidates:
-                    meta = get_ticker_info_safe(cand) # 안전한 함수 호출
-                    if not meta: continue
-                    
-                    q_type = meta.get('quoteType', '').upper()
-                    
-                    if q_type == 'EQUITY':
-                        final_ticker = cand
-                        final_info = meta
-                        break
-                    elif 'ETF' in q_type or 'FUND' in q_type:
-                        break # ETF/FUND는 스킵
-                
-                if not final_ticker:
-                    count_skipped += 1
-                    continue # 개별주 아님 -> 스킵
-                
-                # 개별주 확인됨
-                count_equity += 1
-                
-                # 2. 데이터 다운로드
                 try:
-                    df = yf.download(final_ticker, period="2y", interval="1d", progress=False, auto_adjust=False)
-                    if isinstance(df.columns, pd.MultiIndex):
-                        df.columns = df.columns.get_level_values(0)
+                    # smart_download가 내부적으로 ticker, ticker.KS 등 시도함
+                    final_ticker, df = smart_download(t_clean, "1d", "2y")
                 except:
                     continue
 
                 if len(df) < 250: continue
 
-                # 3. VCP 패턴 체크
+                # 2. VCP 패턴 체크
                 passed, info = check_vcp_pattern(df)
                 if passed:
                     eps1w, eps1m, eps3m = get_eps_changes_from_db(final_ticker)
                     
-                    sector = final_info.get('sector', '')
-                    if not sector: sector = final_info.get('industry', '')
-                    if not sector: sector = final_info.get('shortName', 'Unknown')
+                    # 섹터 정보 (표시용으로만 가져오기)
+                    sector = get_stock_sector(final_ticker)
                     
-                    translations = {
-                        'Technology': '기술', 'Healthcare': '헬스케어', 'Financial Services': '금융',
-                        'Consumer Cyclical': '임의소비재', 'Industrials': '산업재', 'Basic Materials': '소재',
-                        'Energy': '에너지', 'Utilities': '유틸리티', 'Real Estate': '부동산',
-                        'Communication Services': '통신', 'Consumer Defensive': '필수소비재',
-                        'Semiconductors': '반도체'
-                    }
-                    sector_kr = translations.get(sector, sector)
-
                     chart_data_cache[final_ticker] = {'df': df, 'info': info}
                     
                     res.append({
-                        '종목코드': final_ticker, '섹터': sector_kr, '현재가': f"{info['price']:,.0f}",
+                        '종목코드': final_ticker, '섹터': sector, '현재가': f"{info['price']:,.0f}",
                         '비고': info['status'], 
                         '손절가': f"{info['stop_loss']:,.0f}", 
                         '목표가(3R)': f"{info['target_price']:,.0f}",
@@ -900,10 +856,9 @@ with tab3:
                         'Pivot': f"{info['pivot']:,.0f}" 
                     })
             bar.empty()
-            status_text.empty() # 진행 텍스트 지우기
+            status_text.empty() 
             
-            # 최종 리포트 출력
-            st.success(f"✅ 분석 완료! 총 {count_total}개 중 **개별주식 {count_equity}개**를 검사했습니다. (ETF/기타 {count_skipped}개 제외)")
+            st.success(f"✅ 분석 완료! 총 {count_total}개 전체 종목을 검사했습니다.")
             
             if res:
                 # [수정] 비고 열을 내림차순(ascending=False)으로 정렬하여 4단계가 위로 오게 함

@@ -361,7 +361,7 @@ def calculate_daily_indicators(df):
     return df
 
 # -----------------------------------------------------------------------------
-# [VCP 패턴] 수정: 60일 기준, 20일 구간, 변동성 축소 확인
+# [VCP 패턴] 60일 기준, 20일 구간, 변동성 축소 확인
 # -----------------------------------------------------------------------------
 def check_vcp_pattern(df):
     if len(df) < 250: return False, None
@@ -386,7 +386,7 @@ def check_vcp_pattern(df):
     stage_1_pass = cond1 and cond2 and cond4 and cond5 and cond6
     if not stage_1_pass: return False, None 
 
-    # [수정] 2. 파동 (60일 기준, 20일씩 3구간)
+    # 2. 파동 (60일 기준, 20일씩 3구간)
     window = 60
     subset = df.iloc[-window:]
     p1 = subset.iloc[:20]    # 20일
@@ -441,6 +441,41 @@ def check_vcp_pattern(df):
         'price': curr['Close'],
         'pivot': pivot_point # 차트 그리기용 피봇 반환
     }
+
+# -----------------------------------------------------------------------------
+# [NEW] 일봉 -> 주봉 변환 후 MACD 상태 계산 함수
+# -----------------------------------------------------------------------------
+def get_weekly_macd_status(daily_df):
+    try:
+        # 일봉 데이터를 주봉(금요일 기준)으로 리샘플링
+        df_w = daily_df.resample('W-FRI').agg({
+            'Close': 'last', 'High': 'max', 'Low': 'min', 'Volume': 'sum'
+        }).dropna()
+        
+        if len(df_w) < 26: return "-"
+
+        # 주봉 MACD (12, 26, 9) 계산
+        ema12 = df_w['Close'].ewm(span=12, adjust=False).mean()
+        ema26 = df_w['Close'].ewm(span=26, adjust=False).mean()
+        macd_line = ema12 - ema26
+        signal_line = macd_line.ewm(span=9, adjust=False).mean()
+        
+        curr_macd = macd_line.iloc[-1]
+        curr_sig = signal_line.iloc[-1]
+        prev_macd = macd_line.iloc[-2]
+        prev_sig = signal_line.iloc[-2]
+        
+        # 상태 판별
+        if curr_macd > curr_sig:
+            # 이번주에 막 골든크로스 발생했는지 확인
+            if prev_macd <= prev_sig:
+                return "⚡GC (매수신호)"
+            else:
+                return "🔵 Buy (유지)"
+        else:
+            return "🔻 Sell (매도)"
+    except:
+        return "-"
 
 # -----------------------------------------------------------------------------
 # [NEW] VCP 차트 그리기 함수 (Plotly)
@@ -803,7 +838,7 @@ with tab2:
 with tab3:
     cols = st.columns(12)
     
-    # [NEW] VCP 버튼 (차트 검증 + 정렬 수정 + 개별주 필터링 삭제 + 2열 그리드 차트)
+    # [NEW] VCP 버튼 (차트 검증 + 정렬 수정 + 개별주 필터링 삭제 + 2열 그리드 차트 + 주봉MACD)
     if cols[0].button("🌪️ VCP"):
         tickers = get_tickers_from_sheet()
         if not tickers: st.warning("종목 리스트(TGT) 없음")
@@ -841,6 +876,9 @@ with tab3:
                 if passed:
                     eps1w, eps1m, eps3m = get_eps_changes_from_db(final_ticker)
                     
+                    # [NEW] 주봉 MACD 상태 계산
+                    weekly_macd_status = get_weekly_macd_status(df)
+                    
                     # 섹터 정보 (표시용으로만 가져오기)
                     sector = get_stock_sector(final_ticker)
                     
@@ -849,6 +887,7 @@ with tab3:
                     res.append({
                         '종목코드': final_ticker, '섹터': sector, '현재가': f"{info['price']:,.0f}",
                         '비고': info['status'], 
+                        '주봉MACD': weekly_macd_status, # [NEW] 주봉 MACD 컬럼 추가
                         '손절가': f"{info['stop_loss']:,.0f}", 
                         '목표가(3R)': f"{info['target_price']:,.0f}",
                         '스퀴즈': info['squeeze'],
@@ -883,7 +922,7 @@ with tab3:
                             cached1 = chart_data_cache[ticker1]
                             fig1 = plot_vcp_chart(cached1['df'], ticker1, cached1['info'])
                             c1.plotly_chart(fig1, use_container_width=True)
-                            c1.caption(f"**{ticker1}** ({item1['섹터']}) | 현재가: {item1['현재가']} | Pivot: {item1['Pivot']}")
+                            c1.caption(f"**{ticker1}** ({item1['섹터']}) | {item1['주봉MACD']} | Pivot: {item1['Pivot']}")
 
                         # 오른쪽 차트 (홀수 개일 경우 에러 방지)
                         if i + 1 < len(breakout_targets):
@@ -893,7 +932,7 @@ with tab3:
                                 cached2 = chart_data_cache[ticker2]
                                 fig2 = plot_vcp_chart(cached2['df'], ticker2, cached2['info'])
                                 c2.plotly_chart(fig2, use_container_width=True)
-                                c2.caption(f"**{ticker2}** ({item2['섹터']}) | 현재가: {item2['현재가']} | Pivot: {item2['Pivot']}")
+                                c2.caption(f"**{ticker2}** ({item2['섹터']}) | {item2['주봉MACD']} | Pivot: {item2['Pivot']}")
                 
                 save_to_supabase(res, "VCP_Pattern")
             else: st.warning("VCP 조건(추세+수렴)을 만족하는 종목이 없습니다.")

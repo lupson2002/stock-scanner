@@ -361,7 +361,7 @@ def calculate_daily_indicators(df):
     return df
 
 # -----------------------------------------------------------------------------
-# [VCP 패턴] 120일 기준, 40일 구간, 4단계 돌파 로직
+# [VCP 패턴] 수정: 60일 기준, 20일 구간, 변동성 축소 확인
 # -----------------------------------------------------------------------------
 def check_vcp_pattern(df):
     if len(df) < 250: return False, None
@@ -386,12 +386,12 @@ def check_vcp_pattern(df):
     stage_1_pass = cond1 and cond2 and cond4 and cond5 and cond6
     if not stage_1_pass: return False, None 
 
-    # 2. 파동 (120일)
-    window = 120 
+    # [수정] 2. 파동 (60일 기준, 20일씩 3구간)
+    window = 60
     subset = df.iloc[-window:]
-    p1 = subset.iloc[:40]   
-    p2 = subset.iloc[40:80] 
-    p3 = subset.iloc[80:]   
+    p1 = subset.iloc[:20]    # 20일
+    p2 = subset.iloc[20:40]  # 20일
+    p3 = subset.iloc[40:]    # 20일
     
     range1 = (p1['High'].max() - p1['Low'].min()) / p1['High'].max()
     range2 = (p2['High'].max() - p2['Low'].min()) / p2['High'].max()

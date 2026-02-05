@@ -544,16 +544,16 @@ def check_daily_condition(df):
     return False, None
 
 # -----------------------------------------------------------------------------
-# [주봉 분석] 수정됨: 돌파수렴 & MACD 매수 조건
+# [주봉 분석] 수정됨: 조건 완화 (현실적인 눌림목 포착)
 # -----------------------------------------------------------------------------
 def check_weekly_condition(df):
     if len(df) < 40: return False, None
     
     # --- 1. 지표 계산 ---
-    # SMA 30
+    # SMA 30 (생명선)
     df['SMA30'] = df['Close'].rolling(window=30).mean()
     
-    # EMA 20
+    # EMA 20 (추세선)
     df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
     
     # RSI 14
@@ -593,59 +593,53 @@ def check_weekly_condition(df):
 
     curr = df.iloc[-1]
     
-    # --- 2. 필수 선행 조건 (무조건 충족) ---
-    # 1) 30주 이동평균선 위
+    # --- 2. 필수 선행 조건 (Trend Filter) ---
+    # 1) 30주 이동평균선 위 (장기 추세)
     cond_basic_1 = curr['Close'] > curr['SMA30']
     
-    # 2) RSI > 50
+    # 2) RSI > 50 (매수세 우위)
     cond_basic_2 = curr['RSI14'] > 50
     
-    # 3) MACD 오실레이터 상승 (이번주 > 지난주)
-    # 비교를 위해 최소 2개 데이터 필요
+    # 3) MACD 오실레이터 상태 (상승 중이거나 or 이미 양수권에서 버티기)
     if len(df) < 2: return False, None
-    cond_basic_3 = df['MACD_Hist'].iloc[-1] > df['MACD_Hist'].iloc[-2]
+    cond_basic_3 = (df['MACD_Hist'].iloc[-1] > df['MACD_Hist'].iloc[-2]) or (df['MACD_Hist'].iloc[-1] > 0)
 
     if not (cond_basic_1 and cond_basic_2 and cond_basic_3):
         return False, None
 
-    # --- 3. 주봉조건 (1) : 돌파수렴 ---
+    # --- 3. 주봉조건 (1) : 돌파수렴 (Squat) - 조건 완화됨 ---
     is_strat_1 = False
     
-    # 데이터 슬라이싱
-    recent_4w = df.iloc[-4:] # 최근 4주
-    past_window = df.iloc[-12:-4] # 그 이전 8주 (총 12주 중 최근 4주 제외한 구간)
+    # 과거 12주 데이터 (이번주 제외)
+    past_12w = df.iloc[-13:-1]
     
-    if len(past_window) > 0:
-        # 1) 12주내 BB(12,2) 돌파 발생 (과거 윈도우에서) & 4주내 미발생
-        # 돌파 기준: 종가가 BB 상단보다 높음
-        past_breakout_mask = past_window['Close'] > bb_up_12.loc[past_window.index]
-        has_past_breakout = past_breakout_mask.any()
+    if len(past_12w) > 0:
+        # A. 과거의 영광: 지난 12주 안에 BB 상단을 돌파한 적이 있는가?
+        past_breakout = (past_12w['Close'] > bb_up_12.loc[past_12w.index]).any()
         
-        recent_breakout = (recent_4w['Close'] > bb_up_12.loc[recent_4w.index]).any()
+        # B. 현재의 휴식: 이번 주는 돌파 상태가 아님 (밴드 안으로 들어옴 or 밴드 근처)
+        current_rest = curr['Close'] <= (bb_up_12.iloc[-1] * 1.02)
         
-        if has_past_breakout and not recent_breakout:
-            # 현재가격 돌파시점가격대비 +5~-3%
-            # 가장 최근의 돌파 시점 찾기
-            last_breakout_idx = past_window[past_breakout_mask].index[-1]
-            breakout_price = past_window.loc[last_breakout_idx]['Close']
+        if past_breakout and current_rest:
+            # C. 가격 지지 (Price Support): 
+            # 고점 대비 너무 많이 빠지지 않았는가? (최근 12주 고가의 85% 이상 가격 유지)
+            recent_high = past_12w['High'].max()
+            price_support = curr['Close'] >= (recent_high * 0.85)
             
-            price_cond = (curr['Close'] <= breakout_price * 1.05) and (curr['Close'] >= breakout_price * 0.97)
+            # D. 추세 지지 (Trend Support):
+            # 현재 종가가 20주 EMA 위에 있는가?
+            ema_support = curr['Close'] > curr['EMA20']
             
-            # 2) 최근 4주간 20일EMA 위 (주봉이므로 EMA20은 20주선)
-            ema_cond = (recent_4w['Close'] > recent_4w['EMA20']).all()
+            # E. 거래량 진정 (Volume Calm):
+            # 이번 주 거래량이 20주 평균 거래량보다 적거나 비슷함 (폭발적 매도세 없음)
+            vol_avg = df['Volume'].iloc[-20:].mean()
+            vol_calm = curr['Volume'] < (vol_avg * 1.2) # 평균의 120% 이하면 인정
             
-            # 3) 한달간 거래량 감소 (최근 4주 평균 < 그 전 4주 평균)
-            vol_recent = recent_4w['Volume'].mean()
-            vol_past = df['Volume'].iloc[-8:-4].mean()
-            vol_cond = vol_recent < vol_past
-            
-            if price_cond and ema_cond and vol_cond:
+            if price_support and ema_support and vol_calm:
                 is_strat_1 = True
 
-    # --- 4. 주봉조건 (2) : MACD 매수 ---
+    # --- 4. 주봉조건 (2) : MACD 매수 (변경 없음) ---
     is_strat_2 = False
-    # MACD(12주,36주,9주) 골든크로스 (이번주 발생)
-    # (지난주 MACD <= Signal) AND (이번주 MACD > Signal)
     prev_macd_c = macd_c.iloc[-2]
     prev_sig_c = sig_c.iloc[-2]
     curr_macd_c = macd_c.iloc[-1]
@@ -656,7 +650,7 @@ def check_weekly_condition(df):
 
     # --- 5. 결과 반환 ---
     status_list = []
-    if is_strat_1: status_list.append("돌파수렴")
+    if is_strat_1: status_list.append("돌파수렴(눌림)")
     if is_strat_2: status_list.append("MACD매수")
     
     if status_list:
@@ -664,8 +658,8 @@ def check_weekly_condition(df):
         return True, {
             'price': curr['Close'], 
             'atr': curr['ATR14'], 
-            'bw_curr': 0, # 미사용
-            'bw_change': final_status, # 여기에 결과 표시
+            'bw_curr': 0, 
+            'bw_change': final_status, 
             'macdv': curr['MACD_V']
         }
     

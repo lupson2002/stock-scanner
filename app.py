@@ -271,12 +271,6 @@ def get_eps_changes_from_db(ticker):
 # 4. 분석 알고리즘 (지표 계산 & 패턴)
 # ==========================================
 
-def find_extrema(df, order=3):
-    prices = df['Close'].values
-    peaks_idx = argrelextrema(prices, np.greater, order=order)[0]
-    troughs_idx = argrelextrema(prices, np.less, order=order)[0]
-    return peaks_idx, troughs_idx
-
 def calculate_macdv(df, short=12, long=26, signal=9):
     ema_fast = df['Close'].ewm(span=short, adjust=False).mean()
     ema_slow = df['Close'].ewm(span=long, adjust=False).mean()
@@ -549,29 +543,132 @@ def check_daily_condition(df):
         }
     return False, None
 
+# -----------------------------------------------------------------------------
+# [주봉 분석] 수정됨: 돌파수렴 & MACD 매수 조건
+# -----------------------------------------------------------------------------
 def check_weekly_condition(df):
-    if len(df) < 60: return False, None
-    df = calculate_common_indicators(df, is_weekly=True)
-    if df is None: return False, None
+    if len(df) < 40: return False, None
     
+    # --- 1. 지표 계산 ---
+    # SMA 30
+    df['SMA30'] = df['Close'].rolling(window=30).mean()
+    
+    # EMA 20
+    df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+    
+    # RSI 14
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / (loss + 1e-9)
+    df['RSI14'] = 100 - (100 / (1 + rs))
+
+    # [선행조건용] MACD (12, 26, 9)
+    e12 = df['Close'].ewm(span=12, adjust=False).mean()
+    e26 = df['Close'].ewm(span=26, adjust=False).mean()
+    macd = e12 - e26
+    sig = macd.ewm(span=9, adjust=False).mean()
+    df['MACD_Hist'] = macd - sig
+
+    # [조건1용] BB (12, 2)
+    sma12 = df['Close'].rolling(12).mean()
+    std12 = df['Close'].rolling(12).std()
+    bb_up_12 = sma12 + (2 * std12)
+    
+    # [조건2용] MACD (12, 36, 9)
+    e12_c = df['Close'].ewm(span=12, adjust=False).mean()
+    e36_c = df['Close'].ewm(span=36, adjust=False).mean()
+    macd_c = e12_c - e36_c
+    sig_c = macd_c.ewm(span=9, adjust=False).mean()
+    
+    # MACD-V (결과 표시용)
+    df['MACD_V'], _ = calculate_macdv(df, 12, 26, 9)
+    
+    # ATR (결과 표시용)
+    high_low = df['High'] - df['Low']
+    high_close = np.abs(df['High'] - df['Close'].shift())
+    low_close = np.abs(df['Low'] - df['Close'].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['ATR14'] = tr.ewm(span=14, adjust=False).mean()
+
     curr = df.iloc[-1]
-    prev = df.iloc[-2]
     
-    cond_bb = curr['Close'] > curr['BB_UP']
-    cond_macd = (prev['MACD_Line'] <= prev['MACD_Signal']) and (curr['MACD_Line'] > curr['MACD_Signal'])
+    # --- 2. 필수 선행 조건 (무조건 충족) ---
+    # 1) 30주 이동평균선 위
+    cond_basic_1 = curr['Close'] > curr['SMA30']
     
-    if cond_bb or cond_macd:
-        bw_past = df['BandWidth'].iloc[-21]
-        bw_change = "감소" if bw_past > curr['BandWidth'] else "증가"
+    # 2) RSI > 50
+    cond_basic_2 = curr['RSI14'] > 50
+    
+    # 3) MACD 오실레이터 상승 (이번주 > 지난주)
+    # 비교를 위해 최소 2개 데이터 필요
+    if len(df) < 2: return False, None
+    cond_basic_3 = df['MACD_Hist'].iloc[-1] > df['MACD_Hist'].iloc[-2]
+
+    if not (cond_basic_1 and cond_basic_2 and cond_basic_3):
+        return False, None
+
+    # --- 3. 주봉조건 (1) : 돌파수렴 ---
+    is_strat_1 = False
+    
+    # 데이터 슬라이싱
+    recent_4w = df.iloc[-4:] # 최근 4주
+    past_window = df.iloc[-12:-4] # 그 이전 8주 (총 12주 중 최근 4주 제외한 구간)
+    
+    if len(past_window) > 0:
+        # 1) 12주내 BB(12,2) 돌파 발생 (과거 윈도우에서) & 4주내 미발생
+        # 돌파 기준: 종가가 BB 상단보다 높음
+        past_breakout_mask = past_window['Close'] > bb_up_12.loc[past_window.index]
+        has_past_breakout = past_breakout_mask.any()
         
+        recent_breakout = (recent_4w['Close'] > bb_up_12.loc[recent_4w.index]).any()
+        
+        if has_past_breakout and not recent_breakout:
+            # 현재가격 돌파시점가격대비 +5~-3%
+            # 가장 최근의 돌파 시점 찾기
+            last_breakout_idx = past_window[past_breakout_mask].index[-1]
+            breakout_price = past_window.loc[last_breakout_idx]['Close']
+            
+            price_cond = (curr['Close'] <= breakout_price * 1.05) and (curr['Close'] >= breakout_price * 0.97)
+            
+            # 2) 최근 4주간 20일EMA 위 (주봉이므로 EMA20은 20주선)
+            ema_cond = (recent_4w['Close'] > recent_4w['EMA20']).all()
+            
+            # 3) 한달간 거래량 감소 (최근 4주 평균 < 그 전 4주 평균)
+            vol_recent = recent_4w['Volume'].mean()
+            vol_past = df['Volume'].iloc[-8:-4].mean()
+            vol_cond = vol_recent < vol_past
+            
+            if price_cond and ema_cond and vol_cond:
+                is_strat_1 = True
+
+    # --- 4. 주봉조건 (2) : MACD 매수 ---
+    is_strat_2 = False
+    # MACD(12주,36주,9주) 골든크로스 (이번주 발생)
+    # (지난주 MACD <= Signal) AND (이번주 MACD > Signal)
+    prev_macd_c = macd_c.iloc[-2]
+    prev_sig_c = sig_c.iloc[-2]
+    curr_macd_c = macd_c.iloc[-1]
+    curr_sig_c = sig_c.iloc[-1]
+    
+    if (prev_macd_c <= prev_sig_c) and (curr_macd_c > curr_sig_c):
+        is_strat_2 = True
+
+    # --- 5. 결과 반환 ---
+    status_list = []
+    if is_strat_1: status_list.append("돌파수렴")
+    if is_strat_2: status_list.append("MACD매수")
+    
+    if status_list:
+        final_status = " / ".join(status_list)
         return True, {
             'price': curr['Close'], 
             'atr': curr['ATR14'], 
-            'bw_curr': curr['BandWidth'], 
-            'bw_past': bw_past, 
-            'bw_change': f"{bw_change} (BB/MACD)", 
+            'bw_curr': 0, # 미사용
+            'bw_change': final_status, # 여기에 결과 표시
             'macdv': curr['MACD_V']
         }
+    
     return False, None
 
 def check_monthly_condition(df):
@@ -887,7 +984,7 @@ with tab3:
                     res.append({
                         '종목코드': final_ticker, '섹터': sector, '현재가': f"{info['price']:,.0f}",
                         '비고': info['status'], 
-                        '주봉MACD': weekly_macd_status, # [NEW] 주봉 MACD 컬럼 추가
+                        '주봉MACD': weekly_macd_status, 
                         '손절가': f"{info['stop_loss']:,.0f}", 
                         '목표가(3R)': f"{info['target_price']:,.0f}",
                         '스퀴즈': info['squeeze'],
@@ -978,9 +1075,8 @@ with tab3:
                     sector = get_stock_sector(rt)
                     res.append({
                         '종목코드': rt, '섹터': sector, '현재가': f"{info['price']:,.0f}",
-                        'ATR(14주)': f"{info['atr']:,.0f}", 'BW현재': f"{info['bw_curr']:.4f}",
+                        'ATR(14주)': f"{info['atr']:,.0f}", '구분': info['bw_change'], # 여기에 '돌파수렴' or 'MACD매수' 표시
                         '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
-                        'BW(20주전)': f"{info['bw_past']:.4f}", 'BW변화': info['bw_change'],
                         'MACD-V': f"{info['macdv']:.2f}", 'BW_Value': f"{info['bw_curr']:.4f}", 'MACD_V_Value': f"{info['macdv']:.2f}"
                     })
             bar.empty()
@@ -1063,7 +1159,7 @@ with tab3:
                 eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
                 res.append({
                     '종목코드': rt, '섹터': sector, '현재가': f"{info_d['price']:,.0f}",
-                    '스퀴즈': info_d['squeeze'], '주봉BW': f"{info_w['bw_curr']:.4f}", '주봉BW변화': info_w['bw_change'],
+                    '스퀴즈': info_d['squeeze'], '주봉BW': f"{info_w['bw_curr']:.4f}", '주봉구분': info_w['bw_change'],
                     '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
                     '현52주신고가일': info_d['high_date'], '전52주신고가일': info_d['prev_date'],
                     '차이일': f"{info_d['diff_days']}일", 'BW_Value': f"{info_w['bw_curr']:.4f}", 'MACD_V_Value': f"{info_d['macdv']:.2f}"
@@ -1092,7 +1188,7 @@ with tab3:
                 eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
                 res.append({
                     '종목코드': rt, '섹터': sector, '현재가': f"{info_w['price']:,.0f}",
-                    '주봉BW': f"{info_w['bw_curr']:.4f}", '주봉BW변화': info_w['bw_change'],
+                    '주봉BW': f"{info_w['bw_curr']:.4f}", '주봉구분': info_w['bw_change'],
                     '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
                     'ATH달성월': info_m['ath_date'], '고권역(월수)': f"{info_m['month_count']}개월",
                     '현52주신고가일': info_m['ath_date'], 'BW_Value': f"{info_w['bw_curr']:.4f}", 'MACD_V_Value': f"{info_w['macdv']:.2f}"
@@ -1129,7 +1225,7 @@ with tab3:
                     '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
                     '현52주신고가일': info_d['high_date'], '전52주신고가일': info_d['prev_date'],
                     '차이일': f"{info_d['diff_days']}일", '주봉BW': f"{info_w['bw_curr']:.4f}",
-                    '주봉BW변화': info_w['bw_change'], 'MACD-V': f"{info_w['macdv']:.2f}",
+                    '주봉구분': info_w['bw_change'], 'MACD-V': f"{info_w['macdv']:.2f}",
                     'BW_Value': f"{info_w['bw_curr']:.4f}", 'MACD_V_Value': f"{info_w['macdv']:.2f}"
                 })
             bar.empty()

@@ -783,8 +783,8 @@ def check_inverse_hs_pattern(df):
 # [NEW] 나침판용 전략 분석 함수 (최적화)
 # -----------------------------------------------------------------------------
 def get_compass_signal():
-    # 1. 설정
-    OFFENSE = ["QQQ", "SPY", "EFA", "GLD", "EEM"]
+    # 1. 설정 (수정됨: SPY->SCHD, EFA->IMTM, EEM->EMGF)
+    OFFENSE = ["QQQ", "SCHD", "IMTM", "GLD", "EMGF"]
     CASH = "BIL"
     ALL_TICKERS = list(set(OFFENSE + [CASH]))
     
@@ -859,7 +859,7 @@ with tab_compass:
     이 탭은 **'전략 3 (평균 모멘텀)'** 로직을 기반으로 **현재 시점(Today)**에서 가장 매력적인 자산을 알려줍니다.
     
     **전략 로직:**
-    1. **후보군:** QQQ(나스닥), SPY(S&P500), EFA(선진국), GLD(금), EEM(신흥국)
+    1. **후보군:** QQQ(나스닥), SCHD(배당성장), IMTM(선진국모멘텀), GLD(금), EMGF(신흥국멀티팩터)
     2. **점수 산출:** `((12개월+6개월)/2 - 3개월) + 1개월` 수익률
     3. **방어 기제:** 1등 종목의 12개월 수익률이 마이너스면 **현금(BIL)** 보유
     """)

@@ -544,7 +544,7 @@ def check_daily_condition(df):
     return False, None
 
 # -----------------------------------------------------------------------------
-# [주봉 분석] 수정됨: 조건 완화 (현실적인 눌림목 포착)
+# [주봉 분석] 수정됨: 조건 완화 (거래량 제한 삭제)
 # -----------------------------------------------------------------------------
 def check_weekly_condition(df):
     if len(df) < 40: return False, None
@@ -607,7 +607,7 @@ def check_weekly_condition(df):
     if not (cond_basic_1 and cond_basic_2 and cond_basic_3):
         return False, None
 
-    # --- 3. 주봉조건 (1) : 돌파수렴 (Squat) - 조건 완화됨 ---
+    # --- 3. 주봉조건 (1) : 돌파수렴 (Squat) - 조건 완화 (거래량 제한 삭제) ---
     is_strat_1 = False
     
     # 과거 12주 데이터 (이번주 제외)
@@ -630,12 +630,9 @@ def check_weekly_condition(df):
             # 현재 종가가 20주 EMA 위에 있는가?
             ema_support = curr['Close'] > curr['EMA20']
             
-            # E. 거래량 진정 (Volume Calm):
-            # 이번 주 거래량이 20주 평균 거래량보다 적거나 비슷함 (폭발적 매도세 없음)
-            vol_avg = df['Volume'].iloc[-20:].mean()
-            vol_calm = curr['Volume'] < (vol_avg * 1.2) # 평균의 120% 이하면 인정
+            # [삭제됨] E. 거래량 진정 조건은 삭제 (반등 시 거래량 폭발 가능성 고려)
             
-            if price_support and ema_support and vol_calm:
+            if price_support and ema_support:
                 is_strat_1 = True
 
     # --- 4. 주봉조건 (2) : MACD 매수 (변경 없음) ---

@@ -136,6 +136,7 @@ def remove_duplicates_from_db():
     except Exception as e:
         st.error(f"중복 제거 실패: {e}")
 
+# [수정됨] 데이터 다운로드 함수: 에러 방지를 위해 중복 인덱스 제거 및 구조 평탄화 추가
 def smart_download(ticker, interval="1d", period="2y"):
     if ':' in ticker: ticker = ticker.split(':')[-1]
     ticker = ticker.replace('/', '-')
@@ -147,10 +148,21 @@ def smart_download(ticker, interval="1d", period="2y"):
         try:
             # 병렬 처리시 yfinance 내부 스레드 충돌 방지를 위해 progress=False 필수
             df = yf.download(t, period=period, interval=interval, progress=False, auto_adjust=False)
-            if len(df) > 0:
+            
+            if not df.empty:
+                # 1. MultiIndex 컬럼 평탄화 (Ticker 레벨 제거)
                 if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-                return t, df
+                    try:
+                        # 레벨 0(Price)만 가져오기
+                        df.columns = df.columns.get_level_values(0)
+                    except: pass
+                
+                # 2. [중요] 중복된 날짜(Index) 제거 (ValueError: cannot reindex... 방지)
+                df = df[~df.index.duplicated(keep='last')]
+                
+                # 3. 필수 컬럼 확인
+                if 'Close' in df.columns:
+                    return t, df
         except:
             continue
     return ticker, pd.DataFrame()
@@ -893,7 +905,6 @@ with tab1:
         if not etfs: st.warning("ETF 목록 없음")
         else:
             st.info("ETF 섹터 분석 중 (모멘텀 전략 3: Smoothed)...")
-            # 병렬 처리 함수 호출
             res = analyze_momentum_strategy_parallel(etfs, "ETF")
             if not res.empty: st.dataframe(res, use_container_width=True)
             else: st.warning("데이터 부족")
@@ -908,7 +919,6 @@ with tab2:
         if not tickers: st.warning("국가 ETF 목록 없음")
         else:
             st.info(f"[국가 ETF] {len(tickers)}개 모멘텀(전략 3) 분석 시작...")
-            # 병렬 처리 함수 호출
             res = analyze_momentum_strategy_parallel(tickers, "국가ETF")
             if not res.empty:
                 st.success(f"[국가] {len(res)}개 분석 완료!")

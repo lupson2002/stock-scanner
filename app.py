@@ -136,7 +136,7 @@ def remove_duplicates_from_db():
     except Exception as e:
         st.error(f"중복 제거 실패: {e}")
 
-# [수정됨] 데이터 다운로드 함수: 날짜 표준화(Timezone 제거)로 계산 일관성 보장
+# [핵심 수정] yf.Ticker().history() 사용으로 스레드 간 데이터 충돌 원천 차단
 def smart_download(ticker, interval="1d", period="2y"):
     if ':' in ticker: ticker = ticker.split(':')[-1]
     ticker = ticker.replace('/', '-')
@@ -146,42 +146,33 @@ def smart_download(ticker, interval="1d", period="2y"):
     
     for t in candidates:
         try:
-            # 병렬 처리시 스레드 충돌 방지를 위해 progress=False
-            df = yf.download(t, period=period, interval=interval, progress=False, auto_adjust=False)
+            # 1. Ticker 객체 생성 (독립된 인스턴스)
+            dat = yf.Ticker(t)
+            # 2. history 메서드로 데이터 요청 (auto_adjust=False로 설정하여 종가/수정종가 분리)
+            df = dat.history(period=period, interval=interval, auto_adjust=False)
             
             if not df.empty:
-                # 1. MultiIndex 컬럼 평탄화
-                if isinstance(df.columns, pd.MultiIndex):
-                    try:
-                        df.columns = df.columns.get_level_values(0)
-                    except: pass
-                
-                # 2. [핵심] 인덱스(날짜) 표준화 (Timezone 제거 및 시간 00:00:00으로 통일)
-                # 이 과정이 없으면 UTC와 Local Time이 섞여서 정렬이 꼬이고 계산값이 매번 달라집니다.
+                # 3. Timezone 제거 및 날짜 정렬 (계산 일관성 확보)
                 try:
-                    if df.index.tz is not None:
-                        df.index = df.index.tz_localize(None) # 타임존 정보 삭제
-                    df.index = df.index.normalize() # 시:분:초 제거 (날짜만 남김)
+                    if df.index.tz is not None: df.index = df.index.tz_localize(None)
+                    df.index = df.index.normalize()
                 except: pass
-
-                # 3. 중복 제거 및 정렬
+                
                 df = df[~df.index.duplicated(keep='last')]
                 df = df.sort_index() 
                 
-                # 4. 필수 컬럼 확인 및 중복 컬럼 제거
+                # 4. 필수 컬럼 확인
                 if 'Close' in df.columns:
-                    if isinstance(df['Close'], pd.DataFrame):
-                         df = df.loc[:, ~df.columns.duplicated()]
-                    
-                    # 5. 결측치 처리 (주말/공휴일 데이터 비는 문제 방지)
+                    # 중복 컬럼 방어
+                    df = df.loc[:, ~df.columns.duplicated()]
+                    # 결측치 채우기
                     df = df.ffill()
-                    
                     return t, df
         except:
             continue
     return ticker, pd.DataFrame()
 
-# [중요] 종목 정보 캐싱
+# [중요] 종목 정보 캐싱 (섹터 정보 표시용으로만 사용)
 @st.cache_data(ttl=3600*24) 
 def get_ticker_info_safe(ticker):
     try:
@@ -313,14 +304,10 @@ def calculate_common_indicators(df, is_weekly=False):
     if len(df) < 60: return None
     df = df.copy()
     
-    # [안전장치] 인덱스 표준화
-    try:
-        if df.index.tz is not None: df.index = df.index.tz_localize(None)
-        df.index = df.index.normalize()
-    except: pass
+    # [안전장치] 중복 인덱스 및 컬럼 제거 + 정렬
     df = df[~df.index.duplicated(keep='last')]
-    df = df.sort_index()
     df = df.loc[:, ~df.columns.duplicated()]
+    df = df.sort_index()
 
     period = 20 if is_weekly else 60
     
@@ -347,11 +334,7 @@ def calculate_daily_indicators(df):
     if len(df) < 260: return None
     df = df.copy()
     
-    # [핵심 수정] 인덱스 표준화 (Timezone 제거 및 정렬)
-    try:
-        if df.index.tz is not None: df.index = df.index.tz_localize(None)
-        df.index = df.index.normalize()
-    except: pass
+    # [핵심 수정] 데이터 정합성 보장
     df = df[~df.index.duplicated(keep='last')]
     df = df.sort_index()
     df = df.loc[:, ~df.columns.duplicated()]

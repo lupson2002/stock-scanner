@@ -162,6 +162,9 @@ def smart_download(ticker, interval="1d", period="2y"):
                 
                 # 3. 필수 컬럼 확인
                 if 'Close' in df.columns:
+                    # 'Close' 컬럼이 중복되어 여러개인 경우 처리 (드물지만 발생 가능)
+                    if isinstance(df['Close'], pd.DataFrame):
+                         df = df.loc[:, ~df.columns.duplicated()] # 중복 컬럼 제거
                     return t, df
         except:
             continue
@@ -299,6 +302,11 @@ def calculate_macdv(df, short=12, long=26, signal=9):
 def calculate_common_indicators(df, is_weekly=False):
     if len(df) < 60: return None
     df = df.copy()
+    
+    # [안전장치] 중복 인덱스 및 컬럼 제거
+    df = df[~df.index.duplicated(keep='last')]
+    df = df.loc[:, ~df.columns.duplicated()]
+
     period = 20 if is_weekly else 60
     
     df[f'EMA{period}'] = df['Close'].ewm(span=period, adjust=False).mean()
@@ -323,6 +331,12 @@ def calculate_common_indicators(df, is_weekly=False):
 def calculate_daily_indicators(df):
     if len(df) < 260: return None
     df = df.copy()
+    
+    # [수정됨] 이 함수 내에서 발생하는 ValueError 방지를 위한 강력한 중복 제거
+    # 1. 인덱스(날짜) 중복 제거
+    df = df[~df.index.duplicated(keep='last')]
+    # 2. 컬럼명 중복 제거 (드물지만 'Close'가 2개인 경우 방지)
+    df = df.loc[:, ~df.columns.duplicated()]
     
     df['SMA50'] = df['Close'].rolling(window=50).mean()
     df['STD50'] = df['Close'].rolling(window=50).std()
@@ -763,9 +777,14 @@ def analyze_momentum_strategy_parallel(target_list, type_name="ETF"):
         for future in as_completed(futures):
             completed += 1
             bar.progress(completed / total)
-            res = future.result()
-            if res:
-                results.append(res)
+            try:
+                res = future.result()
+                if res:
+                    results.append(res)
+            except Exception as e:
+                # 에러 발생 시 로그에만 남기고 중단하지 않음
+                print(f"Error processing item: {e}")
+                continue
     bar.empty()
     
     if results:

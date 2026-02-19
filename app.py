@@ -136,7 +136,7 @@ def remove_duplicates_from_db():
     except Exception as e:
         st.error(f"중복 제거 실패: {e}")
 
-# [수정됨] 데이터 다운로드 함수: 에러 방지를 위해 중복 인덱스 제거 및 구조 평탄화 추가
+# [수정됨] 데이터 다운로드 함수: 정렬 및 중복 제거 강화 (계산 일관성 확보)
 def smart_download(ticker, interval="1d", period="2y"):
     if ':' in ticker: ticker = ticker.split(':')[-1]
     ticker = ticker.replace('/', '-')
@@ -150,21 +150,25 @@ def smart_download(ticker, interval="1d", period="2y"):
             df = yf.download(t, period=period, interval=interval, progress=False, auto_adjust=False)
             
             if not df.empty:
-                # 1. MultiIndex 컬럼 평탄화 (Ticker 레벨 제거)
+                # 1. MultiIndex 컬럼 평탄화
                 if isinstance(df.columns, pd.MultiIndex):
                     try:
-                        # 레벨 0(Price)만 가져오기
                         df.columns = df.columns.get_level_values(0)
                     except: pass
                 
-                # 2. [중요] 중복된 날짜(Index) 제거 (ValueError: cannot reindex... 방지)
+                # 2. [핵심] 인덱스(날짜) 중복 제거 및 "오름차순 정렬"
+                # 정렬이 안 되어 있으면 이동평균 계산값이 매번 달라집니다.
                 df = df[~df.index.duplicated(keep='last')]
+                df = df.sort_index() 
                 
-                # 3. 필수 컬럼 확인
+                # 3. 필수 컬럼 확인 및 중복 컬럼 제거
                 if 'Close' in df.columns:
-                    # 'Close' 컬럼이 중복되어 여러개인 경우 처리 (드물지만 발생 가능)
                     if isinstance(df['Close'], pd.DataFrame):
-                         df = df.loc[:, ~df.columns.duplicated()] # 중복 컬럼 제거
+                         df = df.loc[:, ~df.columns.duplicated()]
+                    
+                    # 4. 결측치 처리 (ffill: 앞의 값으로 채움) - 계산 안정성 확보
+                    df = df.ffill()
+                    
                     return t, df
         except:
             continue
@@ -175,7 +179,6 @@ def smart_download(ticker, interval="1d", period="2y"):
 def get_ticker_info_safe(ticker):
     try:
         tick = yf.Ticker(ticker)
-        # 병렬 처리 시 너무 잦은 info 호출은 느려질 수 있으므로 예외처리 강화
         try:
             meta = tick.info
             if meta: return meta
@@ -303,9 +306,10 @@ def calculate_common_indicators(df, is_weekly=False):
     if len(df) < 60: return None
     df = df.copy()
     
-    # [안전장치] 중복 인덱스 및 컬럼 제거
+    # [안전장치] 중복 인덱스 및 컬럼 제거 + 정렬
     df = df[~df.index.duplicated(keep='last')]
     df = df.loc[:, ~df.columns.duplicated()]
+    df = df.sort_index()
 
     period = 20 if is_weekly else 60
     
@@ -332,10 +336,12 @@ def calculate_daily_indicators(df):
     if len(df) < 260: return None
     df = df.copy()
     
-    # [수정됨] 이 함수 내에서 발생하는 ValueError 방지를 위한 강력한 중복 제거
+    # [핵심 수정] 이 함수 내에서 발생하는 ValueError 및 값 흔들림 방지
     # 1. 인덱스(날짜) 중복 제거
     df = df[~df.index.duplicated(keep='last')]
-    # 2. 컬럼명 중복 제거 (드물지만 'Close'가 2개인 경우 방지)
+    # 2. 날짜 오름차순 정렬 (이게 안되면 이평선 값이 매번 달라짐)
+    df = df.sort_index()
+    # 3. 컬럼명 중복 제거
     df = df.loc[:, ~df.columns.duplicated()]
     
     df['SMA50'] = df['Close'].rolling(window=50).mean()

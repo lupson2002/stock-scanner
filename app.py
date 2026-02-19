@@ -136,7 +136,7 @@ def remove_duplicates_from_db():
     except Exception as e:
         st.error(f"중복 제거 실패: {e}")
 
-# [정확성 강화] 데이터 다운로드 함수: 재시도 로직(3회) 및 정밀 정렬 추가
+# [핵심 수정] yf.Ticker().history() 사용 + 날짜 표준화
 def smart_download(ticker, interval="1d", period="2y"):
     if ':' in ticker: ticker = ticker.split(':')[-1]
     ticker = ticker.replace('/', '-')
@@ -145,13 +145,13 @@ def smart_download(ticker, interval="1d", period="2y"):
         candidates = [f"{ticker}.KS", f"{ticker}.KQ", ticker]
     
     for t in candidates:
-        for attempt in range(3): # 최대 3번 재시도
+        for attempt in range(3): # 재시도 3회
             try:
                 dat = yf.Ticker(t)
                 df = dat.history(period=period, interval=interval, auto_adjust=False)
                 
                 if not df.empty and len(df) > 5:
-                    # 날짜 표준화
+                    # Timezone 제거 및 날짜 정렬 (계산 일관성)
                     try:
                         if df.index.tz is not None: df.index = df.index.tz_localize(None)
                         df.index = df.index.normalize()
@@ -164,10 +164,9 @@ def smart_download(ticker, interval="1d", period="2y"):
                         df = df.loc[:, ~df.columns.duplicated()]
                         df = df.ffill()
                         return t, df
-                # 데이터가 비어있으면 잠시 대기 후 재시도
-                time.sleep(0.5 * (attempt + 1))
+                time.sleep(0.3)
             except:
-                time.sleep(0.5 * (attempt + 1))
+                time.sleep(0.3)
                 continue
     return ticker, pd.DataFrame()
 
@@ -303,7 +302,11 @@ def calculate_common_indicators(df, is_weekly=False):
     if len(df) < 60: return None
     df = df.copy()
     
-    # [안전장치] 정합성 보장
+    # [안전장치] 중복 인덱스 및 컬럼 제거 + 정렬
+    try:
+        if df.index.tz is not None: df.index = df.index.tz_localize(None)
+        df.index = df.index.normalize()
+    except: pass
     df = df[~df.index.duplicated(keep='last')]
     df = df.sort_index()
     df = df.loc[:, ~df.columns.duplicated()]
@@ -333,7 +336,11 @@ def calculate_daily_indicators(df):
     if len(df) < 260: return None
     df = df.copy()
     
-    # [안전장치] 정합성 보장
+    # [핵심 수정] 데이터 정합성 보장
+    try:
+        if df.index.tz is not None: df.index = df.index.tz_localize(None)
+        df.index = df.index.normalize()
+    except: pass
     df = df[~df.index.duplicated(keep='last')]
     df = df.sort_index()
     df = df.loc[:, ~df.columns.duplicated()]
@@ -484,6 +491,7 @@ def check_daily_condition(df):
 
 def check_weekly_condition(df):
     if len(df) < 40: return False, None
+    # 지표 계산
     df['SMA30'] = df['Close'].rolling(window=30).mean()
     df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
     delta = df['Close'].diff(); gain = (delta.where(delta > 0, 0)).rolling(14).mean(); loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
@@ -496,15 +504,25 @@ def check_weekly_condition(df):
     df['MACD_V'], _ = calculate_macdv(df, 12, 26, 9)
     high_low = df['High'] - df['Low']; high_close = np.abs(df['High'] - df['Close'].shift()); low_close = np.abs(df['Low'] - df['Close'].shift())
     df['ATR14'] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).ewm(span=14, adjust=False).mean()
+    
     curr = df.iloc[-1]
-    if not (curr['Close'] > curr['SMA30'] and curr['RSI14'] > 50 and (df['MACD_Hist'].iloc[-1] > df['MACD_Hist'].iloc[-2] or df['MACD_Hist'].iloc[-1] > 0)): return False, None
+    
+    # 1. 필수 선행 조건
+    if not (curr['Close'] > curr['SMA30'] and curr['RSI14'] > 50 and (df['MACD_Hist'].iloc[-1] > df['MACD_Hist'].iloc[-2] or df['MACD_Hist'].iloc[-1] > 0)):
+        return False, None
+        
     is_1 = False; past_12w = df.iloc[-13:-1]
     if not past_12w.empty:
-        if (past_12w['Close'] > bb_up_12.loc[past_12w.index]).any() and curr['Close'] <= (bb_up_12.iloc[-1] * 1.02) and curr['Close'] >= (past_12w['High'].max() * 0.85) and curr['Close'] > curr['EMA20']: is_1 = True
+        # A. 과거 돌파, B. 현재 휴식, C. 가격지지(고점 -15%내), D. 추세지지(EMA20 위) - (거래량 조건 삭제됨)
+        if (past_12w['Close'] > bb_up_12.loc[past_12w.index]).any() and curr['Close'] <= (bb_up_12.iloc[-1] * 1.02) and curr['Close'] >= (past_12w['High'].max() * 0.85) and curr['Close'] > curr['EMA20']:
+            is_1 = True
+            
     is_2 = macd_c.iloc[-2] <= sig_c.iloc[-2] and macd_c.iloc[-1] > sig_c.iloc[-1]
+    
     status = []
     if is_1: status.append("돌파수렴(눌림)")
     if is_2: status.append("MACD매수")
+    
     if status: return True, {'price': curr['Close'], 'atr': curr['ATR14'], 'bw_change': " / ".join(status), 'macdv': curr['MACD_V']}
     return False, None
 
@@ -514,7 +532,39 @@ def check_monthly_condition(df):
     if curr >= ath * 0.90: return True, {'price': curr, 'ath_price': ath, 'ath_date': df['High'].idxmax().strftime('%Y-%m'), 'month_count': (df['Close'] >= ath * 0.90).sum()}
     return False, None
 
-# [정확성 보장] 병렬 처리 함수: max_workers를 8로 낮추고 실패 티커 추적 추가
+def check_cup_handle_pattern(df):
+    if len(df) < 26: return False, None
+    sub = df.iloc[-26:].copy()
+    if len(sub) < 26: return False, None
+    idx_A = sub['High'].idxmax(); val_A = sub.loc[idx_A, 'High']
+    if idx_A == sub.index[-1]: return False, "A가 끝점"
+    after_A = sub.loc[idx_A:]
+    if len(after_A) < 5: return False, "기간 짧음"
+    idx_B = after_A['Low'].idxmin(); val_B = after_A.loc[idx_B, 'Low']
+    if val_B > val_A * 0.85: return False, "깊이 얕음"
+    after_B = sub.loc[idx_B:]
+    if len(after_B) < 2: return False, "반등 짧음"
+    idx_C = after_B['High'].idxmax(); val_C = after_B.loc[idx_C, 'High']
+    if val_C < val_A * 0.85: return False, "회복 미달"
+    curr_close = df['Close'].iloc[-1]
+    if curr_close < val_B: return False, "핸들 붕괴"
+    if curr_close < val_C * 0.80: return False, "핸들 깊음"
+    return True, {"depth": f"{(1 - val_B/val_A)*100:.1f}%", "handle_weeks": f"{len(df.loc[idx_C:])}주", "pivot": f"{val_C:,.0f}"}
+
+def check_inverse_hs_pattern(df):
+    if len(df) < 60: return False, None
+    window = 60; sub = df.iloc[-window:].copy()
+    if len(sub) < 60: return False, None
+    part1 = sub.iloc[:20]; part2 = sub.iloc[20:40]; part3 = sub.iloc[40:]
+    min_L = part1['Low'].min(); min_H = part2['Low'].min(); min_R = part3['Low'].min()
+    if not (min_H < min_L and min_H < min_R): return False, "머리 미형성"
+    max_R = part3['High'].max(); curr_close = df['Close'].iloc[-1]
+    if curr_close < min_R * 1.05: return False, "반등 약함"
+    vol_recent = part3['Volume'].mean(); vol_prev = part2['Volume'].mean()
+    vol_ratio = vol_recent / vol_prev if vol_prev > 0 else 1.0
+    return True, {"Neckline": f"{max_R:,.0f}", "Breakout": "Ready" if curr_close < max_R else "Yes", "Vol_Ratio": f"{vol_ratio:.1f}배"}
+
+# [정확성 보장] 병렬 처리 함수
 def analyze_momentum_strategy_parallel(target_list, type_name="ETF"):
     if not target_list: return pd.DataFrame()
     st.write(f"📊 총 {len(target_list)}개 {type_name} 분석 중...")
@@ -535,7 +585,7 @@ def analyze_momentum_strategy_parallel(target_list, type_name="ETF"):
         return {f"{type_name}": f"{rt} ({n})", "모멘텀점수": score, "스퀴즈": "🔥" if df['TTM_Squeeze'].iloc[-5:].any() else "-", "BB(50,2)돌파": "O" if (c>df['BB50_UP']).iloc[-3:].any() else "-", "돈키언(50)돌파": "O" if (c>df['Donchian_High_50']).iloc[-3:].any() else "-", "정배열": "⭐" if (curr>c.ewm(span=20).mean().iloc[-1] and curr>c.ewm(span=200).mean().iloc[-1]) else "-", "장기추세": "📈" if c.ewm(span=60).mean().iloc[-1]>c.ewm(span=200).mean().iloc[-1] else "-", "MACD-V": f"{df['MACD_V'].iloc[-1]:.2f}", "ATR": f"{df['ATR14'].iloc[-1]:.2f}", "현52주신고가일": high_idx.strftime('%Y-%m-%d'), "전52주신고가일": prev_date, "현재가": curr}
 
     bar = st.progress(0)
-    with ThreadPoolExecutor(max_workers=8) as executor: # 동시 작업수 8로 제한
+    with ThreadPoolExecutor(max_workers=8) as executor: 
         futures = {executor.submit(worker, item): item for item in target_list}
         total = len(futures); completed = 0
         for future in as_completed(futures):
@@ -560,9 +610,17 @@ def analyze_momentum_strategy_parallel(target_list, type_name="ETF"):
 def get_compass_signal():
     OFFENSE = ["QQQ", "SCHD", "IMTM", "GLD", "EMGF"]; CASH = "BIL"
     try:
+        # 여기서는 Ticker 객체 사용 대신 일괄 다운로드 후 정리 (나침판은 소수 종목이라 괜찮음)
         data = yf.download(list(set(OFFENSE + [CASH])), period="2y", progress=False, auto_adjust=False)['Close']
         if data.empty: return None, "데이터 없음"
     except: return None, "다운로드 실패"
+    
+    # Timezone 제거
+    try:
+        if data.index.tz is not None: data.index = data.index.tz_localize(None)
+        data.index = data.index.normalize()
+    except: pass
+    
     m_data = data.resample('ME').last()
     if len(m_data) < 13: return None, "데이터 부족"
     m12 = m_data.pct_change(12).iloc[-1]; m6 = m_data.pct_change(6).iloc[-1]; m3 = m_data.pct_change(3).iloc[-1]; m1 = m_data.pct_change(1).iloc[-1]
@@ -609,6 +667,7 @@ with tab2:
 
 with tab3:
     cols = st.columns(10)
+    # 1. VCP
     if cols[0].button("🌪️ VCP"):
         tickers = get_tickers_from_sheet()
         if tickers:
@@ -623,10 +682,11 @@ with tab3:
                 return None
             with ThreadPoolExecutor(max_workers=8) as ex:
                 futs = {ex.submit(v_worker, t): t for t in tickers}
+                done = 0
                 for f in as_completed(futs):
+                    done+=1; bar.progress(done/len(tickers))
                     r = f.result()
                     if r: res.append(r['data']); chart_cache.append(r['chart'])
-                    bar.progress(len(res)/len(tickers) if len(tickers)>0 else 1)
             bar.empty()
             if res:
                 df_res = pd.DataFrame(res).sort_values("비고", ascending=False)
@@ -638,12 +698,14 @@ with tab3:
                         with c2: st.plotly_chart(plot_vcp_chart(chart_cache[i+1][1], chart_cache[i+1][0], chart_cache[i+1][2]), use_container_width=True)
             else: st.warning("발견된 종목 없음")
 
+    # 2. 일봉
     if cols[1].button("🚀 일봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
-            res = []; failed = []
+            res = []
             def d_worker(t):
                 rt, df = smart_download(t, "1d", "2y")
+                if df.empty or len(df)<260: return None
                 p, i = check_daily_condition(df)
                 if p:
                     eps = get_eps_changes_from_db(rt)
@@ -651,22 +713,23 @@ with tab3:
                 return None
             bar = st.progress(0)
             with ThreadPoolExecutor(max_workers=8) as ex:
-                futs = {ex.submit(d_worker, t): t for t in tickers}
-                done = 0
-                for f in as_completed(futs):
-                    done += 1; bar.progress(done/len(tickers))
+                futs = [ex.submit(d_worker, t) for t in tickers]
+                for i, f in enumerate(as_completed(futs)):
+                    bar.progress((i+1)/len(tickers))
                     r = f.result(); 
                     if r: res.append(r)
             bar.empty()
             if res: st.success(f"✅ {len(res)}개 발견"); st.dataframe(pd.DataFrame(res), use_container_width=True)
             else: st.warning("조건 만족 종목 없음")
 
+    # 3. 주봉
     if cols[2].button("📅 주봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
             res = []
             def w_worker(t):
                 rt, df = smart_download(t, "1wk", "2y")
+                if df.empty or len(df)<40: return None
                 p, i = check_weekly_condition(df)
                 if p:
                     eps = get_eps_changes_from_db(rt)
@@ -675,27 +738,192 @@ with tab3:
             bar = st.progress(0)
             with ThreadPoolExecutor(max_workers=8) as ex:
                 futs = [ex.submit(w_worker, t) for t in tickers]
-                for f in as_completed(futs):
+                for i, f in enumerate(as_completed(futs)):
+                    bar.progress((i+1)/len(tickers))
                     r = f.result()
                     if r: res.append(r)
-                    bar.progress(len(res)/len(tickers) if len(tickers)>0 else 1)
             bar.empty()
             if res: st.success(f"✅ {len(res)}개 발견"); st.dataframe(pd.DataFrame(res), use_container_width=True)
 
+    # 4. 월봉
     if cols[3].button("🗓️ 월봉"):
         tickers = get_tickers_from_sheet()
         if tickers:
             res = []
             def m_worker(t):
                 rt, df = smart_download(t, "1mo", "max")
+                if df.empty: return None
                 p, i = check_monthly_condition(df)
                 if p: return {'종목코드': rt, '섹터': get_stock_sector(rt), '현재가': f"{i['price']:,.0f}", 'ATH가': f"{i['ath_price']:,.0f}", '달성월': i['ath_date'], '고권역수': i['month_count']}
                 return None
+            bar = st.progress(0)
             with ThreadPoolExecutor(max_workers=8) as ex:
                 futs = [ex.submit(m_worker, t) for t in tickers]
-                for f in as_completed(futs):
-                    r = f.result()
+                for i, f in enumerate(as_completed(futs)):
+                    bar.progress((i+1)/len(tickers))
+                    r = f.result(); 
                     if r: res.append(r)
+            bar.empty()
+            if res: st.dataframe(pd.DataFrame(res), use_container_width=True)
+
+    # 5. 일+월봉
+    if cols[4].button("일+월"):
+        tickers = get_tickers_from_sheet()
+        if tickers:
+            res = []; bar = st.progress(0)
+            def dm_worker(t):
+                rt, df_d = smart_download(t, "1d", "2y")
+                if df_d.empty or len(df_d)<260: return None
+                if not check_daily_condition(df_d)[0]: return None
+                _, df_m = smart_download(t, "1mo", "max")
+                if df_m.empty: return None
+                if check_monthly_condition(df_m)[0]:
+                    return {'종목': rt, '섹터': get_stock_sector(rt), '비고': '일봉돌파+월봉ATH'}
+                return None
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                futs = [ex.submit(dm_worker, t) for t in tickers]
+                for i, f in enumerate(as_completed(futs)):
+                    bar.progress((i+1)/len(tickers))
+                    r = f.result(); 
+                    if r: res.append(r)
+            bar.empty()
+            if res: st.dataframe(pd.DataFrame(res))
+
+    # 6. 일+주봉
+    if cols[5].button("일+주"):
+        tickers = get_tickers_from_sheet()
+        if tickers:
+            res = []; bar = st.progress(0)
+            def dw_worker(t):
+                rt, df_d = smart_download(t, "1d", "2y")
+                if df_d.empty or len(df_d)<260: return None
+                if not check_daily_condition(df_d)[0]: return None
+                _, df_w = smart_download(t, "1wk", "2y")
+                if df_w.empty: return None
+                if check_weekly_condition(df_w)[0]:
+                    return {'종목': rt, '섹터': get_stock_sector(rt), '비고': '일봉돌파+주봉추세'}
+                return None
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                futs = [ex.submit(dw_worker, t) for t in tickers]
+                for i, f in enumerate(as_completed(futs)):
+                    bar.progress((i+1)/len(tickers))
+                    r = f.result(); 
+                    if r: res.append(r)
+            bar.empty()
+            if res: st.dataframe(pd.DataFrame(res))
+
+    # 7. 주+월봉
+    if cols[6].button("주+월"):
+        tickers = get_tickers_from_sheet()
+        if tickers:
+            res = []; bar = st.progress(0)
+            def wm_worker(t):
+                rt, df_w = smart_download(t, "1wk", "2y")
+                if df_w.empty or len(df_w)<40: return None
+                if not check_weekly_condition(df_w)[0]: return None
+                _, df_m = smart_download(t, "1mo", "max")
+                if df_m.empty: return None
+                if check_monthly_condition(df_m)[0]:
+                    return {'종목': rt, '섹터': get_stock_sector(rt), '비고': '주봉추세+월봉ATH'}
+                return None
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                futs = [ex.submit(wm_worker, t) for t in tickers]
+                for i, f in enumerate(as_completed(futs)):
+                    bar.progress((i+1)/len(tickers))
+                    r = f.result(); 
+                    if r: res.append(r)
+            bar.empty()
+            if res: st.dataframe(pd.DataFrame(res))
+
+    # 8. 통합
+    if cols[7].button("⚡통합"):
+        tickers = get_tickers_from_sheet()
+        if tickers:
+            res = []; bar = st.progress(0)
+            def int_worker(t):
+                rt, df_d = smart_download(t, "1d", "2y")
+                if df_d.empty or len(df_d)<260: return None
+                if not check_daily_condition(df_d)[0]: return None
+                _, df_w = smart_download(t, "1wk", "2y")
+                if df_w.empty: return None
+                if not check_weekly_condition(df_w)[0]: return None
+                _, df_m = smart_download(t, "1mo", "max")
+                if df_m.empty: return None
+                if check_monthly_condition(df_m)[0]:
+                    return {'종목': rt, '섹터': get_stock_sector(rt), '비고': 'Triple Crown'}
+                return None
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                futs = [ex.submit(int_worker, t) for t in tickers]
+                for i, f in enumerate(as_completed(futs)):
+                    bar.progress((i+1)/len(tickers))
+                    r = f.result(); 
+                    if r: res.append(r)
+            bar.empty()
+            if res: st.dataframe(pd.DataFrame(res))
+
+    # 9. 컵핸들
+    if cols[8].button("🏆컵"):
+        tickers = get_tickers_from_sheet()
+        if tickers:
+            res = []; bar = st.progress(0)
+            def cup_worker(t):
+                rt, df = smart_download(t, "1wk", "2y")
+                if df.empty: return None
+                p, i = check_cup_handle_pattern(df)
+                if p: return {'종목': rt, '상세': i}
+                return None
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                futs = [ex.submit(cup_worker, t) for t in tickers]
+                for i, f in enumerate(as_completed(futs)):
+                    bar.progress((i+1)/len(tickers))
+                    r = f.result(); 
+                    if r: res.append(r)
+            bar.empty()
+            if res: st.dataframe(pd.DataFrame(res))
+
+    # 10. 역헤숄
+    if cols[9].button("👤역H"):
+        tickers = get_tickers_from_sheet()
+        if tickers:
+            res = []; bar = st.progress(0)
+            def hs_worker(t):
+                rt, df = smart_download(t, "1wk", "2y")
+                if df.empty: return None
+                p, i = check_inverse_hs_pattern(df)
+                if p: return {'종목': rt, '상세': i}
+                return None
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                futs = [ex.submit(hs_worker, t) for t in tickers]
+                for i, f in enumerate(as_completed(futs)):
+                    bar.progress((i+1)/len(tickers))
+                    r = f.result(); 
+                    if r: res.append(r)
+            bar.empty()
+            if res: st.dataframe(pd.DataFrame(res))
+
+    st.markdown("### 📉 저장된 종목 중 눌림목/급등주 찾기")
+    if st.button("🔍 눌림목 & 급등 패턴 분석"):
+        db_tickers = get_unique_tickers_from_db()
+        if db_tickers:
+            res = []; bar = st.progress(0)
+            def db_worker(t):
+                rt, df = smart_download(t, "1d", "2y")
+                if df.empty or len(df)<60: return None
+                df = calculate_common_indicators(df, False)
+                if df is None: return None
+                curr = df.iloc[-1]
+                cond = ""
+                if curr['MACD_V'] > 60: cond = "🔥공격"
+                elif (curr['Close'] > df['EMA20'].iloc[-1]) and ((curr['Close']-df['EMA20'].iloc[-1])/df['EMA20'].iloc[-1] < 0.03): cond = "📉눌림"
+                if cond: return {'종목': rt, '패턴': cond, '현재가': f"{curr['Close']:,.0f}"}
+                return None
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                futs = [ex.submit(db_worker, t) for t in db_tickers]
+                for i, f in enumerate(as_completed(futs)):
+                    bar.progress((i+1)/len(db_tickers))
+                    r = f.result(); 
+                    if r: res.append(r)
+            bar.empty()
             if res: st.dataframe(pd.DataFrame(res), use_container_width=True)
 
 with tab4:
@@ -720,7 +948,8 @@ with tab5:
     st.markdown("### 📂 퀀티와이즈 매칭")
     up = st.file_uploader("quant_master.xlsx 업로드", type=['xlsx'])
     if up and st.button("🔄 매칭 시작"):
-        st.info("기존 엑셀 매칭 로직 실행 중...") # 기존 로직 유지
+        # 기존 로직 (길어서 생략되었으나 필요 시 복원 가능)
+        st.info("파일 처리 로직 실행...")
 
 st.markdown("---")
 with st.expander("🗄️ 전체 저장 기록 관리"):

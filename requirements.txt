@@ -7,4 +7,5 @@ scipy
 openpyxl
 requests
 plotly
-
+finance-datareader
+beautifulsoup4

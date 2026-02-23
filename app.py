@@ -9,6 +9,13 @@ from scipy.signal import argrelextrema
 import time
 import re
 
+# [NEW] 한국 ETF 스크래핑용 추가 라이브러리
+import FinanceDataReader as fdr
+import requests
+from bs4 import BeautifulSoup
+import random
+import concurrent.futures
+
 # =========================================================
 # [설정] Supabase 연결 정보 (보안 적용)
 # =========================================================
@@ -155,7 +162,6 @@ def smart_download(ticker, interval="1d", period="2y"):
             continue
     return ticker, pd.DataFrame()
 
-# [중요] 종목 정보 캐싱 (섹터 정보 표시용으로만 사용)
 @st.cache_data(ttl=3600*24) 
 def get_ticker_info_safe(ticker):
     try:
@@ -216,9 +222,6 @@ def save_to_supabase(data_list, strategy_name):
     except Exception as e:
         st.error(f"DB 저장 실패: {e}")
 
-# ==============================================================================
-# [핵심 로직] 정규화 및 DB 조회
-# ==============================================================================
 def normalize_ticker_for_db_storage(t):
     if not t: return ""
     t_str = str(t).upper().strip()
@@ -354,9 +357,6 @@ def calculate_daily_indicators(df):
     df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
     return df
 
-# -----------------------------------------------------------------------------
-# [VCP 패턴] 60일 기준, 20일 구간, 변동성 축소 확인
-# -----------------------------------------------------------------------------
 def check_vcp_pattern(df):
     if len(df) < 250: return False, None
     df = calculate_daily_indicators(df) 
@@ -367,7 +367,6 @@ def check_vcp_pattern(df):
     sma150 = df['Close'].rolling(150).mean().iloc[-1]
     sma200 = df['Close'].rolling(200).mean().iloc[-1]
     
-    # 1. 추세
     cond1 = curr['Close'] > sma150 and curr['Close'] > sma200
     cond2 = sma150 > sma200
     cond3 = df['SMA50'].iloc[-1] > df['SMA50'].iloc[-20] 
@@ -380,7 +379,6 @@ def check_vcp_pattern(df):
     stage_1_pass = cond1 and cond2 and cond4 and cond5 and cond6
     if not stage_1_pass: return False, None 
 
-    # 2. 파동 (60일 기준, 20일씩 3구간)
     window = 60
     subset = df.iloc[-window:]
     p1 = subset.iloc[:20]    # 20일
@@ -394,7 +392,6 @@ def check_vcp_pattern(df):
     contraction = (range3 < range2) or (range2 < range1) or (range3 < 0.12)
     if not contraction: return False, None
 
-    # 3. 셋업 (거래량)
     last_vol_avg = p3['Volume'].mean()
     prev_vol_avg = p1['Volume'].mean()
     vol_dry_up = last_vol_avg < prev_vol_avg * 1.2 
@@ -406,7 +403,6 @@ def check_vcp_pattern(df):
     risk = curr['Close'] - stop_loss
     target_price = curr['Close'] + (risk * 3) if risk > 0 else 0
     
-    # 4. 돌파
     prior_days = p3.iloc[:-1] 
     if len(prior_days) > 0:
         pivot_point = prior_days['High'].max() 
@@ -433,22 +429,17 @@ def check_vcp_pattern(df):
         'target_price': target_price,
         'squeeze': "🔥" if df['TTM_Squeeze'].iloc[-1] else "-",
         'price': curr['Close'],
-        'pivot': pivot_point # 차트 그리기용 피봇 반환
+        'pivot': pivot_point 
     }
 
-# -----------------------------------------------------------------------------
-# [NEW] 일봉 -> 주봉 변환 후 MACD 상태 계산 함수
-# -----------------------------------------------------------------------------
 def get_weekly_macd_status(daily_df):
     try:
-        # 일봉 데이터를 주봉(금요일 기준)으로 리샘플링
         df_w = daily_df.resample('W-FRI').agg({
             'Close': 'last', 'High': 'max', 'Low': 'min', 'Volume': 'sum'
         }).dropna()
         
         if len(df_w) < 26: return "-"
 
-        # 주봉 MACD (12, 26, 9) 계산
         ema12 = df_w['Close'].ewm(span=12, adjust=False).mean()
         ema26 = df_w['Close'].ewm(span=26, adjust=False).mean()
         macd_line = ema12 - ema26
@@ -459,9 +450,7 @@ def get_weekly_macd_status(daily_df):
         prev_macd = macd_line.iloc[-2]
         prev_sig = signal_line.iloc[-2]
         
-        # 상태 판별
         if curr_macd > curr_sig:
-            # 이번주에 막 골든크로스 발생했는지 확인
             if prev_macd <= prev_sig:
                 return "⚡GC (매수신호)"
             else:
@@ -471,16 +460,10 @@ def get_weekly_macd_status(daily_df):
     except:
         return "-"
 
-# -----------------------------------------------------------------------------
-# [NEW] VCP 차트 그리기 함수 (Plotly)
-# -----------------------------------------------------------------------------
 def plot_vcp_chart(df, ticker, info):
-    # 최근 1년치 데이터만 표시
     df_plot = df.iloc[-252:].copy()
-    
     fig = go.Figure()
 
-    # 1. 캔들 차트
     fig.add_trace(go.Candlestick(
         x=df_plot.index,
         open=df_plot['Open'], high=df_plot['High'],
@@ -488,26 +471,21 @@ def plot_vcp_chart(df, ticker, info):
         name='Price'
     ))
 
-    # 2. 이동평균선
     fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['Close'].rolling(50).mean(), line=dict(color='green', width=1), name='SMA 50'))
     fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['Close'].rolling(150).mean(), line=dict(color='blue', width=1), name='SMA 150'))
     fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['Close'].rolling(200).mean(), line=dict(color='red', width=1), name='SMA 200'))
 
-    # 3. 피봇 포인트 (돌파 기준) - 빨간 점선
     fig.add_hline(y=info['pivot'], line_dash="dot", line_color="red", annotation_text="Pivot (Breakout)")
-
-    # 4. 스탑로스 (손절 라인) - 파란 점선
     fig.add_hline(y=info['stop_loss'], line_dash="dot", line_color="blue", annotation_text="Stop Loss")
 
     fig.update_layout(
         title=f"{ticker} - VCP Analysis Chart",
         xaxis_rangeslider_visible=False,
         height=600,
-        template="plotly_dark" # 다크 모드
+        template="plotly_dark" 
     )
     return fig
 
-# ... (나머지 체크 함수들: check_daily_condition 등 기존 유지) ...
 def check_daily_condition(df):
     if len(df) < 260: return False, None
     df = calculate_daily_indicators(df)
@@ -543,48 +521,35 @@ def check_daily_condition(df):
         }
     return False, None
 
-# -----------------------------------------------------------------------------
-# [주봉 분석] 수정됨: 조건 완화 (거래량 제한 삭제)
-# -----------------------------------------------------------------------------
 def check_weekly_condition(df):
     if len(df) < 40: return False, None
     
-    # --- 1. 지표 계산 ---
-    # SMA 30 (생명선)
     df['SMA30'] = df['Close'].rolling(window=30).mean()
-    
-    # EMA 20 (추세선)
     df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
     
-    # RSI 14
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / (loss + 1e-9)
     df['RSI14'] = 100 - (100 / (1 + rs))
 
-    # [선행조건용] MACD (12, 26, 9)
     e12 = df['Close'].ewm(span=12, adjust=False).mean()
     e26 = df['Close'].ewm(span=26, adjust=False).mean()
     macd = e12 - e26
     sig = macd.ewm(span=9, adjust=False).mean()
     df['MACD_Hist'] = macd - sig
 
-    # [조건1용] BB (12, 2)
     sma12 = df['Close'].rolling(12).mean()
     std12 = df['Close'].rolling(12).std()
     bb_up_12 = sma12 + (2 * std12)
     
-    # [조건2용] MACD (12, 36, 9)
     e12_c = df['Close'].ewm(span=12, adjust=False).mean()
     e36_c = df['Close'].ewm(span=36, adjust=False).mean()
     macd_c = e12_c - e36_c
     sig_c = macd_c.ewm(span=9, adjust=False).mean()
     
-    # MACD-V (결과 표시용)
     df['MACD_V'], _ = calculate_macdv(df, 12, 26, 9)
     
-    # ATR (결과 표시용)
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
     low_close = np.abs(df['Low'] - df['Close'].shift())
@@ -593,49 +558,27 @@ def check_weekly_condition(df):
 
     curr = df.iloc[-1]
     
-    # --- 2. 필수 선행 조건 (Trend Filter) ---
-    # 1) 30주 이동평균선 위 (장기 추세)
     cond_basic_1 = curr['Close'] > curr['SMA30']
-    
-    # 2) RSI > 50 (매수세 우위)
     cond_basic_2 = curr['RSI14'] > 50
-    
-    # 3) MACD 오실레이터 상태 (상승 중이거나 or 이미 양수권에서 버티기)
     if len(df) < 2: return False, None
     cond_basic_3 = (df['MACD_Hist'].iloc[-1] > df['MACD_Hist'].iloc[-2]) or (df['MACD_Hist'].iloc[-1] > 0)
 
     if not (cond_basic_1 and cond_basic_2 and cond_basic_3):
         return False, None
 
-    # --- 3. 주봉조건 (1) : 돌파수렴 (Squat) - 조건 완화 (거래량 제한 삭제) ---
     is_strat_1 = False
-    
-    # 과거 12주 데이터 (이번주 제외)
     past_12w = df.iloc[-13:-1]
     
     if len(past_12w) > 0:
-        # A. 과거의 영광: 지난 12주 안에 BB 상단을 돌파한 적이 있는가?
         past_breakout = (past_12w['Close'] > bb_up_12.loc[past_12w.index]).any()
-        
-        # B. 현재의 휴식: 이번 주는 돌파 상태가 아님 (밴드 안으로 들어옴 or 밴드 근처)
         current_rest = curr['Close'] <= (bb_up_12.iloc[-1] * 1.02)
-        
         if past_breakout and current_rest:
-            # C. 가격 지지 (Price Support): 
-            # 고점 대비 너무 많이 빠지지 않았는가? (최근 12주 고가의 85% 이상 가격 유지)
             recent_high = past_12w['High'].max()
             price_support = curr['Close'] >= (recent_high * 0.85)
-            
-            # D. 추세 지지 (Trend Support):
-            # 현재 종가가 20주 EMA 위에 있는가?
             ema_support = curr['Close'] > curr['EMA20']
-            
-            # [삭제됨] E. 거래량 진정 조건은 삭제 (반등 시 거래량 폭발 가능성 고려)
-            
             if price_support and ema_support:
                 is_strat_1 = True
 
-    # --- 4. 주봉조건 (2) : MACD 매수 (변경 없음) ---
     is_strat_2 = False
     prev_macd_c = macd_c.iloc[-2]
     prev_sig_c = sig_c.iloc[-2]
@@ -645,7 +588,6 @@ def check_weekly_condition(df):
     if (prev_macd_c <= prev_sig_c) and (curr_macd_c > curr_sig_c):
         is_strat_2 = True
 
-    # --- 5. 결과 반환 ---
     status_list = []
     if is_strat_1: status_list.append("돌파수렴(눌림)")
     if is_strat_2: status_list.append("MACD매수")
@@ -693,7 +635,6 @@ def analyze_momentum_strategy(target_list, type_name="ETF"):
         align = "⭐ 정배열" if (curr>ema20.iloc[-1] and curr>ema60.iloc[-1] and curr>ema100.iloc[-1] and curr>ema200.iloc[-1]) else "-"
         long_tr = "📈 상승" if (ema60.iloc[-1]>ema100.iloc[-1]>ema200.iloc[-1]) else "-"
         
-        # [변경] 전략 3: 평균 모멘텀 (Smoothed)
         r12 = c.pct_change(252).iloc[-1] if len(c) > 252 else 0
         r6  = c.pct_change(126).iloc[-1] if len(c) > 126 else 0
         r3  = c.pct_change(63).iloc[-1] if len(c) > 63 else 0
@@ -770,58 +711,43 @@ def check_inverse_hs_pattern(df):
     vol_ratio = vol_recent / vol_prev if vol_prev > 0 else 1.0
     return True, {"Neckline": f"{max_R:,.0f}", "Breakout": "Ready" if curr_close < max_R else "Yes", "Vol_Ratio": f"{vol_ratio:.1f}배"}
 
-# -----------------------------------------------------------------------------
-# [NEW] 나침판용 전략 분석 함수 (최적화)
-# -----------------------------------------------------------------------------
 def get_compass_signal():
-    # 1. 설정 (수정됨: SPY->SCHD, EFA->IMTM, EEM->EMGF)
     OFFENSE = ["QQQ", "SCHD", "IMTM", "GLD", "EMGF"]
     CASH = "BIL"
     ALL_TICKERS = list(set(OFFENSE + [CASH]))
     
-    # 2. 데이터 다운로드 (최근 2년치만)
     try:
         data = yf.download(ALL_TICKERS, period="2y", progress=False, auto_adjust=False)['Close']
         if data.empty: return None, "데이터 없음"
     except:
         return None, "다운로드 실패"
 
-    # 3. 월봉 리샘플링
     monthly_data = data.resample('ME').last()
-    
     if len(monthly_data) < 13: return None, "데이터 부족 (최소 13개월 필요)"
 
-    # 4. 지표 계산 (마지막 시점 기준)
-    # pct_change는 (현재 - 과거) / 과거
     m12 = monthly_data.pct_change(12).iloc[-1]
     m6  = monthly_data.pct_change(6).iloc[-1]
     m3  = monthly_data.pct_change(3).iloc[-1]
     m1  = monthly_data.pct_change(1).iloc[-1]
 
-    # 5. 전략 3 (Smoothed) 스코어 계산
-    # 공식: ((12M + 6M) / 2 - 3M) + 1M
     scores = {}
     for ticker in OFFENSE:
         if ticker not in m12.index: continue
-        
         r12 = m12[ticker]
         r6  = m6[ticker]
         r3  = m3[ticker]
         r1  = m1[ticker]
-        
-        # NaN 체크
         if np.isnan(r12): continue
         
         avg_long = (r12 + r6) / 2
         score = (avg_long - r3) + r1
         scores[ticker] = {
             "Score": score * 100,
-            "12M_Trend": r12 # 절대 모멘텀 확인용
+            "12M_Trend": r12 
         }
     
     if not scores: return None, "계산 불가"
 
-    # 6. 순위 산정
     df_scores = pd.DataFrame(scores).T
     df_scores = df_scores.sort_values("Score", ascending=False)
     
@@ -829,21 +755,97 @@ def get_compass_signal():
     best_score = df_scores.iloc[0]['Score']
     best_trend = df_scores.iloc[0]['12M_Trend']
     
-    # 7. 포지션 결정 (절대 모멘텀 필터)
     final_position = best_ticker if (best_score > 0 and best_trend > 0) else CASH
-    
     return df_scores, final_position
+
+# ==========================================
+# [NEW] 한국 상장 ETF 모멘텀 분석 로직 (병렬 수집)
+# ==========================================
+def fetch_korean_etf_data(ticker, name):
+    time.sleep(random.uniform(0.05, 0.25))
+    url = f"https://finance.naver.com/item/coinfo.naver?code={ticker}"
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    try:
+        res = requests.get(url, headers=headers, timeout=5)
+        res.encoding = 'euc-kr' 
+        soup = BeautifulSoup(res.text, 'html.parser')
+        
+        target_table = soup.find('table', summary='1개월 수익률 정보')
+        ret_1m, ret_3m, ret_6m, ret_12m = None, None, None, None
+        
+        if target_table:
+            rows = target_table.find('tbody').find_all('tr')
+            for row in rows:
+                th_text = row.find('th').text.strip() 
+                td_text = row.find('td').text.strip() 
+                
+                try:
+                    val = float(td_text.replace('%', '').replace('+', '').replace(',', ''))
+                except ValueError:
+                    val = None
+                
+                if '1개월' in th_text: ret_1m = val
+                elif '3개월' in th_text: ret_3m = val
+                elif '6개월' in th_text: ret_6m = val
+                elif '1년' in th_text: ret_12m = val
+                
+        return {
+            'Symbol': ticker, 'Name': name,
+            '1M_Return(%)': ret_1m, '3M_Return(%)': ret_3m,
+            '6M_Return(%)': ret_6m, '12M_Return(%)': ret_12m
+        }
+    except Exception as e:
+        return {
+            'Symbol': ticker, 'Name': name,
+            '1M_Return(%)': None, '3M_Return(%)': None, 
+            '6M_Return(%)': None, '12M_Return(%)': None
+        }
+
+def run_korean_etf_analysis():
+    df_etf = fdr.StockListing('ETF/KR')
+    df_etf = df_etf[~df_etf['Name'].str.contains('레버리지|인버스', na=False)]
+    
+    tickers = df_etf['Symbol'].tolist()
+    names = df_etf['Name'].tolist()
+    
+    results = []
+    items_to_fetch = list(zip(tickers, names))
+    
+    # 스트림릿 UI용 프로그레스 바
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    total = len(items_to_fetch)
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(fetch_korean_etf_data, ticker, name) for ticker, name in items_to_fetch]
+        
+        for i, future in enumerate(concurrent.futures.as_completed(futures)):
+            results.append(future.result())
+            # 화면 업데이트 (부하를 줄이기 위해 10번에 한 번 혹은 마지막에 갱신)
+            if i % 10 == 0 or i == total - 1:
+                progress_bar.progress((i + 1) / total)
+                status_text.text(f"🚀 네이버 금융 스크래핑 진행 중... ({i+1}/{total})")
+
+    progress_bar.empty()
+    status_text.empty()
+    
+    df_returns = pd.DataFrame(results)
+    df_returns['Momentum_Score'] = (
+        0.5 * (df_returns['12M_Return(%)'] + df_returns['6M_Return(%)']) 
+        - df_returns['3M_Return(%)'] 
+        + df_returns['1M_Return(%)']
+    )
+    
+    df_returns = df_returns.dropna(subset=['Momentum_Score']).sort_values(by='Momentum_Score', ascending=False).reset_index(drop=True)
+    return df_returns
+
 
 # ==========================================
 # 5. 메인 실행 화면
 # ==========================================
 
-# [변경] 탭 순서 변경: 나침판(tab_compass)을 맨 앞으로
 tab_compass, tab1, tab2, tab3, tab4, tab5 = st.tabs(["🧭 나침판", "🌍 섹터", "🏳️ 국가", "📊 기술적 분석", "💰 재무분석", "📂 엑셀 데이터 매칭"])
 
-# -----------------------------------------------------------------------------
-# [탭 1] 나침판 (가장 왼쪽으로 이동)
-# -----------------------------------------------------------------------------
 with tab_compass:
     st.markdown("### 🧭 투자 나침판 (Smoothed Momentum Strategy)")
     st.markdown("""
@@ -891,10 +893,11 @@ with tab_compass:
                 st.error(f"분석 실패: {position}")
 
 # -----------------------------------------------------------------------------
-# [탭 2] 섹터 (두 번째로 이동)
+# [탭 2] 섹터 (여기에 한국 ETF 버튼 추가)
 # -----------------------------------------------------------------------------
 with tab1:
     cols = st.columns(12) 
+    
     if cols[0].button("🌍 섹터"):
         etfs = get_etfs_from_sheet()
         if not etfs: st.warning("ETF 목록 없음")
@@ -904,9 +907,28 @@ with tab1:
             if not res.empty: st.dataframe(res, use_container_width=True)
             else: st.warning("데이터 부족")
 
-# -----------------------------------------------------------------------------
-# [탭 3] 국가 (기존 위치 유지)
-# -----------------------------------------------------------------------------
+    # [NEW] 한국 ETF 모멘텀 버튼 추가
+    if cols[1].button("🇰🇷 한국ETF"):
+        st.info("한국 상장 ETF 리스트를 불러오고 분석을 시작합니다... (레버리지/인버스 제외, 약 1~2분 소요)")
+        
+        # 병렬 분석 함수 실행
+        df_korea_etf = run_korean_etf_analysis()
+        
+        if not df_korea_etf.empty:
+            st.success(f"✅ 총 {len(df_korea_etf)}개 한국 ETF 분석 완료!")
+            st.dataframe(df_korea_etf, use_container_width=True)
+            
+            # [NEW] CSV 다운로드 버튼 제공 (Colab의 files.download 대신)
+            csv_data = df_korea_etf.to_csv(index=False, encoding='utf-8-sig')
+            st.download_button(
+                label="📥 분석 결과 CSV로 다운로드",
+                data=csv_data,
+                file_name="korea_etf_momentum.csv",
+                mime="text/csv"
+            )
+        else:
+            st.error("데이터를 불러오지 못했습니다. 네트워크 상태를 확인해 주세요.")
+
 with tab2:
     cols = st.columns(12)
     if cols[0].button("🏳️ 국가"):
@@ -920,56 +942,39 @@ with tab2:
                 st.dataframe(res, use_container_width=True)
             else: st.warning("데이터 부족")
 
-# -----------------------------------------------------------------------------
-# [탭 4] 기술적 분석 (VCP 포함)
-# -----------------------------------------------------------------------------
 with tab3:
     cols = st.columns(12)
     
-    # [NEW] VCP 버튼 (차트 검증 + 정렬 수정 + 개별주 필터링 삭제 + 2열 그리드 차트 + 주봉MACD)
     if cols[0].button("🌪️ VCP"):
         tickers = get_tickers_from_sheet()
         if not tickers: st.warning("종목 리스트(TGT) 없음")
         else:
             st.info(f"구글 시트에서 총 **{len(tickers)}**개 종목을 불러왔습니다.")
             
-            # 진행상황 표시용
             status_text = st.empty()
             bar = st.progress(0)
             
             res = []
             chart_data_cache = {}
-            
-            # 카운터 변수
             count_total = len(tickers)
             
             for i, t in enumerate(tickers):
                 status_text.text(f"⏳ 진행 중... ({i+1}/{count_total}) - {t}")
                 bar.progress((i+1)/len(tickers))
-                
-                # 1. 데이터 다운로드 (즉시 시도)
-                # 티커 클렌징 (공백 제거)
                 t_clean = t.strip()
                 
                 try:
-                    # smart_download가 내부적으로 ticker, ticker.KS 등 시도함
                     final_ticker, df = smart_download(t_clean, "1d", "2y")
                 except:
                     continue
 
                 if len(df) < 250: continue
 
-                # 2. VCP 패턴 체크
                 passed, info = check_vcp_pattern(df)
                 if passed:
                     eps1w, eps1m, eps3m = get_eps_changes_from_db(final_ticker)
-                    
-                    # [NEW] 주봉 MACD 상태 계산
                     weekly_macd_status = get_weekly_macd_status(df)
-                    
-                    # 섹터 정보 (표시용으로만 가져오기)
                     sector = get_stock_sector(final_ticker)
-                    
                     chart_data_cache[final_ticker] = {'df': df, 'info': info}
                     
                     res.append({
@@ -988,22 +993,17 @@ with tab3:
             st.success(f"✅ 분석 완료! 총 {count_total}개 전체 종목을 검사했습니다.")
             
             if res:
-                # [수정] 비고 열을 내림차순(ascending=False)으로 정렬하여 4단계가 위로 오게 함
                 df_res = pd.DataFrame(res).sort_values("비고", ascending=False)
                 st.dataframe(df_res, use_container_width=True)
                 
-                # [NEW] 4단계 돌파 종목 자동 차트 갤러리 (2열 그리드)
                 breakout_targets = [r for r in res if "4단계" in r['비고']]
 
                 if breakout_targets:
                     st.markdown("---")
                     st.markdown("### 🚀 돌파 종목 차트 갤러리 (Step 4)")
-                    
-                    # 그리드 레이아웃 생성
                     for i in range(0, len(breakout_targets), 2):
                         c1, c2 = st.columns(2)
                         
-                        # 왼쪽 차트
                         item1 = breakout_targets[i]
                         ticker1 = item1['종목코드']
                         if ticker1 in chart_data_cache:
@@ -1012,7 +1012,6 @@ with tab3:
                             c1.plotly_chart(fig1, use_container_width=True)
                             c1.caption(f"**{ticker1}** ({item1['섹터']}) | {item1['주봉MACD']} | Pivot: {item1['Pivot']}")
 
-                        # 오른쪽 차트 (홀수 개일 경우 에러 방지)
                         if i + 1 < len(breakout_targets):
                             item2 = breakout_targets[i+1]
                             ticker2 = item2['종목코드']
@@ -1066,7 +1065,7 @@ with tab3:
                     sector = get_stock_sector(rt)
                     res.append({
                         '종목코드': rt, '섹터': sector, '현재가': f"{info['price']:,.0f}",
-                        'ATR(14주)': f"{info['atr']:,.0f}", '구분': info['bw_change'], # 여기에 '돌파수렴' or 'MACD매수' 표시
+                        'ATR(14주)': f"{info['atr']:,.0f}", '구분': info['bw_change'], 
                         '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
                         'MACD-V': f"{info['macdv']:.2f}", 'BW_Value': f"{info['bw_curr']:.4f}", 'MACD_V_Value': f"{info['macdv']:.2f}"
                     })

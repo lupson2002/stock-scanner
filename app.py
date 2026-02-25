@@ -811,7 +811,6 @@ def run_korean_etf_analysis():
     results = []
     items_to_fetch = list(zip(tickers, names))
     
-    # 스트림릿 UI용 프로그레스 바
     progress_bar = st.progress(0)
     status_text = st.empty()
     total = len(items_to_fetch)
@@ -821,7 +820,6 @@ def run_korean_etf_analysis():
         
         for i, future in enumerate(concurrent.futures.as_completed(futures)):
             results.append(future.result())
-            # 화면 업데이트 (부하를 줄이기 위해 10번에 한 번 혹은 마지막에 갱신)
             if i % 10 == 0 or i == total - 1:
                 progress_bar.progress((i + 1) / total)
                 status_text.text(f"🚀 네이버 금융 스크래핑 진행 중... ({i+1}/{total})")
@@ -839,6 +837,69 @@ def run_korean_etf_analysis():
     df_returns = df_returns.dropna(subset=['Momentum_Score']).sort_values(by='Momentum_Score', ascending=False).reset_index(drop=True)
     return df_returns
 
+
+# ==========================================
+# [NEW] 듀얼 MA 돌파 (Phase 1, 3) 스크리닝 알고리즘
+# ==========================================
+def check_dual_ma_breakout(df):
+    if len(df) < 250: return False, None
+    df = df.copy()
+
+    df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+    df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
+    df['DC_High'] = df['High'].rolling(window=20).max().shift(1)
+
+    df['Gap_Pct'] = (df['EMA20'] - df['EMA200']).abs() / df['EMA200'] * 100
+    df['Trend_Up'] = df['EMA200'] > df['EMA200'].shift(20)
+    df['Is_Squeezed'] = df['Gap_Pct'] <= 5.0
+
+    curr_idx = len(df) - 1
+    curr = df.iloc[curr_idx]
+
+    # 오늘 종가가 돈키언 채널 상단을 돌파했는지
+    is_breakout_today = curr['Close'] > curr['DC_High']
+    if not is_breakout_today:
+        return False, None
+
+    # 10일 연속 수렴 계산 (Rolling)
+    df['Squeeze_10d'] = df['Is_Squeezed'].rolling(window=10).sum() == 10
+
+    # ----------------------------------------------------
+    # Phase 1 검사: 최근 5일 이내에 수렴(10일연속)+대추세우상향 상태였는가?
+    # ----------------------------------------------------
+    phase1_candidate = False
+    for i in range(curr_idx - 5, curr_idx):
+        if df['Trend_Up'].iloc[i] and df['Squeeze_10d'].iloc[i]:
+            phase1_candidate = True
+            break
+
+    if phase1_candidate:
+        return True, {
+            "Phase": "Phase 1 (1차돌파)",
+            "Price": curr['Close'],
+            "EMA20": curr['EMA20']
+        }
+
+    # ----------------------------------------------------
+    # Phase 3 검사: 과거(5일~40일 전)에 Phase 1(돌파)이 발생했고, 
+    # 이후 20일선을 한 번도 깨지 않고 지지한 뒤 오늘 재돌파했는가?
+    # ----------------------------------------------------
+    for i in range(curr_idx - 40, curr_idx - 4):
+        was_squeezed_and_trend = df['Squeeze_10d'].iloc[i-1] and df['Trend_Up'].iloc[i-1]
+        was_breakout = df['Close'].iloc[i] > df['DC_High'].iloc[i]
+
+        if was_squeezed_and_trend and was_breakout:
+            pullback_period = df.iloc[i+1:curr_idx]
+            # 눌림목 구간에서 종가가 20일선을 한 번이라도 이탈했는지 확인
+            if (pullback_period['Close'] >= pullback_period['EMA20']).all():
+                return True, {
+                    "Phase": "Phase 3 (2차확정)",
+                    "Price": curr['Close'],
+                    "EMA20": curr['EMA20']
+                }
+            break # 20일선을 이탈했다면 해당 파동은 무효화
+
+    return False, None
 
 # ==========================================
 # 5. 메인 실행 화면
@@ -893,7 +954,7 @@ with tab_compass:
                 st.error(f"분석 실패: {position}")
 
 # -----------------------------------------------------------------------------
-# [탭 2] 섹터 (여기에 한국 ETF 버튼 추가)
+# [탭 2] 섹터
 # -----------------------------------------------------------------------------
 with tab1:
     cols = st.columns(12) 
@@ -907,18 +968,15 @@ with tab1:
             if not res.empty: st.dataframe(res, use_container_width=True)
             else: st.warning("데이터 부족")
 
-    # [NEW] 한국 ETF 모멘텀 버튼 추가
     if cols[1].button("🇰🇷 한국ETF"):
         st.info("한국 상장 ETF 리스트를 불러오고 분석을 시작합니다... (레버리지/인버스 제외, 약 1~2분 소요)")
         
-        # 병렬 분석 함수 실행
         df_korea_etf = run_korean_etf_analysis()
         
         if not df_korea_etf.empty:
             st.success(f"✅ 총 {len(df_korea_etf)}개 한국 ETF 분석 완료!")
             st.dataframe(df_korea_etf, use_container_width=True)
             
-            # [NEW] CSV 다운로드 버튼 제공 (Colab의 files.download 대신)
             csv_data = df_korea_etf.to_csv(index=False, encoding='utf-8-sig')
             st.download_button(
                 label="📥 분석 결과 CSV로 다운로드",
@@ -1225,7 +1283,35 @@ with tab3:
                 save_to_supabase(res, "Integrated_Triple")
             else: st.warning("3가지 조건을 모두 만족하는 종목이 없습니다.")
 
-    if cols[8].button("🏆 컵핸들"):
+    # ==========================================
+    # [NEW] 듀얼 MA 돌파 (Phase 1, Phase 3 스크리닝)
+    # ==========================================
+    if cols[8].button("🔥 듀얼MA돌파"):
+        tickers = get_tickers_from_sheet()
+        if tickers:
+            st.info("[듀얼MA 돌파] Phase 1 & 3 스크리닝 중...")
+            bar = st.progress(0); res = []
+            for i, t in enumerate(tickers):
+                bar.progress((i+1)/len(tickers))
+                rt, df = smart_download(t, "1d", "2y")
+                pass_dual, info = check_dual_ma_breakout(df)
+                if pass_dual:
+                    sector = get_stock_sector(rt)
+                    eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
+                    res.append({
+                        '종목코드': rt, '섹터': sector, '현재가': f"{info['Price']:,.0f}",
+                        '신호': info['Phase'], '손절/트레일링(EMA20)': f"{info['EMA20']:,.0f}",
+                        '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
+                        'BW_Value': "0", 'MACD_V_Value': "0" 
+                    })
+            bar.empty()
+            if res:
+                st.success(f"[듀얼MA 돌파] Phase 1 또는 Phase 3 에 해당하는 {len(res)}개 종목 발견!")
+                st.dataframe(pd.DataFrame(res).drop(columns=['BW_Value', 'MACD_V_Value'], errors='ignore'))
+                save_to_supabase(res, "Dual_MA_Breakout")
+            else: st.warning("현재 Phase 1 또는 Phase 3 조건을 만족하는 종목이 없습니다.")
+
+    if cols[9].button("🏆 컵핸들"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info("[컵핸들] 분석 중...")
@@ -1253,7 +1339,7 @@ with tab3:
                 save_to_supabase(res, "CupHandle")
             else: st.warning("조건 만족 없음")
 
-    if cols[9].button("👤 역H&S"):
+    if cols[10].button("👤 역H&S"):
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info("[역H&S] 분석 중...")

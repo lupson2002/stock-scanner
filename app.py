@@ -839,7 +839,7 @@ def run_korean_etf_analysis():
 
 
 # ==========================================
-# [NEW] 듀얼 MA 돌파 (Phase 1, 3) 스크리닝 알고리즘
+# [NEW] 듀얼 MA 돌파 (Phase 1, 3) 스크리닝 알고리즘 (5일 수렴 & 상태 전환 추적)
 # ==========================================
 def check_dual_ma_breakout(df):
     if len(df) < 250: return False, None
@@ -853,53 +853,65 @@ def check_dual_ma_breakout(df):
     df['Trend_Up'] = df['EMA200'] > df['EMA200'].shift(20)
     df['Is_Squeezed'] = df['Gap_Pct'] <= 5.0
 
+    # Phase 0: 5일 연속 수렴 계산 (기존 10일에서 5일로 단축)
+    df['Squeeze_5d'] = df['Is_Squeezed'].rolling(window=5).sum() == 5
+
+    # 특정 시점(idx)의 Phase 상태를 반환하는 내부 헬퍼 함수
+    def get_phase(idx):
+        if idx < 50: return "대기/눌림목"
+        curr = df.iloc[idx]
+        is_breakout = curr['Close'] > curr['DC_High']
+        
+        if is_breakout:
+            # Phase 1 검사: 최근 5일 이내에 수렴 5일 + 추세 조건이 있었는가?
+            phase1_candidate = False
+            for i in range(idx - 5, idx):
+                if df['Trend_Up'].iloc[i] and df['Squeeze_5d'].iloc[i]:
+                    phase1_candidate = True
+                    break
+            if phase1_candidate:
+                return "Phase 1"
+
+            # Phase 3 검사: 과거에 Phase 1이 발생했고, 20일선 안 깨고 재돌파인가?
+            for i in range(idx - 40, idx - 4):
+                was_squeezed_and_trend = df['Squeeze_5d'].iloc[i-1] and df['Trend_Up'].iloc[i-1]
+                was_breakout_past = df['Close'].iloc[i] > df['DC_High'].iloc[i]
+
+                if was_squeezed_and_trend and was_breakout_past:
+                    pullback_period = df.iloc[i+1:idx]
+                    if len(pullback_period) > 0 and (pullback_period['Close'] >= pullback_period['EMA20']).all():
+                        return "Phase 3"
+                    break
+            
+            # 1단계, 3단계 신규가 아니면 이미 돌파가 되어 상승 중인 상태임
+            return "상승진행중"
+            
+        else:
+            # 돌파하지 않은 상태에서의 구분
+            if df['Squeeze_5d'].iloc[idx] and df['Trend_Up'].iloc[idx]:
+                return "Phase 0 (수렴)"
+            return "대기/눌림목"
+
     curr_idx = len(df) - 1
-    curr = df.iloc[curr_idx]
+    today_phase = get_phase(curr_idx)
 
-    # 오늘 종가가 돈키언 채널 상단을 돌파했는지
-    is_breakout_today = curr['Close'] > curr['DC_High']
-    if not is_breakout_today:
-        return False, None
+    # 오늘 상태가 Phase 1 또는 Phase 3 일 때만 추출
+    if today_phase in ["Phase 1", "Phase 3"]:
+        yest_phase = get_phase(curr_idx - 1)
+        
+        # 전일 상태와 오늘 상태가 다르면 "오늘 새롭게 터진 신규 돌파"로 간주
+        is_new_breakout = (today_phase != yest_phase)
 
-    # 10일 연속 수렴 계산 (Rolling)
-    df['Squeeze_10d'] = df['Is_Squeezed'].rolling(window=10).sum() == 10
-
-    # ----------------------------------------------------
-    # Phase 1 검사: 최근 5일 이내에 수렴(10일연속)+대추세우상향 상태였는가?
-    # ----------------------------------------------------
-    phase1_candidate = False
-    for i in range(curr_idx - 5, curr_idx):
-        if df['Trend_Up'].iloc[i] and df['Squeeze_10d'].iloc[i]:
-            phase1_candidate = True
-            break
-
-    if phase1_candidate:
         return True, {
-            "Phase": "Phase 1 (1차돌파)",
-            "Price": curr['Close'],
-            "EMA20": curr['EMA20']
+            "Today_Phase": today_phase + ("(1차 진입)" if today_phase == "Phase 1" else "(2차 불타기)"),
+            "Yest_Phase": yest_phase,
+            "Price": df.iloc[curr_idx]['Close'],
+            "EMA20": df.iloc[curr_idx]['EMA20'],
+            "Is_New": is_new_breakout
         }
 
-    # ----------------------------------------------------
-    # Phase 3 검사: 과거(5일~40일 전)에 Phase 1(돌파)이 발생했고, 
-    # 이후 20일선을 한 번도 깨지 않고 지지한 뒤 오늘 재돌파했는가?
-    # ----------------------------------------------------
-    for i in range(curr_idx - 40, curr_idx - 4):
-        was_squeezed_and_trend = df['Squeeze_10d'].iloc[i-1] and df['Trend_Up'].iloc[i-1]
-        was_breakout = df['Close'].iloc[i] > df['DC_High'].iloc[i]
-
-        if was_squeezed_and_trend and was_breakout:
-            pullback_period = df.iloc[i+1:curr_idx]
-            # 눌림목 구간에서 종가가 20일선을 한 번이라도 이탈했는지 확인
-            if (pullback_period['Close'] >= pullback_period['EMA20']).all():
-                return True, {
-                    "Phase": "Phase 3 (2차확정)",
-                    "Price": curr['Close'],
-                    "EMA20": curr['EMA20']
-                }
-            break # 20일선을 이탈했다면 해당 파동은 무효화
-
     return False, None
+
 
 # ==========================================
 # 5. 메인 실행 화면
@@ -1284,12 +1296,12 @@ with tab3:
             else: st.warning("3가지 조건을 모두 만족하는 종목이 없습니다.")
 
     # ==========================================
-    # [NEW] 듀얼 MA 돌파 (Phase 1, Phase 3 스크리닝)
+    # [NEW] 듀얼 MA 돌파 (Phase 1, Phase 3 스크리닝) - 정렬 & 전일 상태 추적 적용
     # ==========================================
     if cols[8].button("🔥 듀얼MA돌파"):
         tickers = get_tickers_from_sheet()
         if tickers:
-            st.info("[듀얼MA 돌파] Phase 1 & 3 스크리닝 중...")
+            st.info("[듀얼MA 돌파] Phase 1 & 3 스크리닝 중 (신규 돌파 우선 정렬)...")
             bar = st.progress(0); res = []
             for i, t in enumerate(tickers):
                 bar.progress((i+1)/len(tickers))
@@ -1299,15 +1311,27 @@ with tab3:
                     sector = get_stock_sector(rt)
                     eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
                     res.append({
+                        '상태': "🚨당일신규" if info['Is_New'] else "▶️상승지속",
                         '종목코드': rt, '섹터': sector, '현재가': f"{info['Price']:,.0f}",
-                        '신호': info['Phase'], '손절/트레일링(EMA20)': f"{info['EMA20']:,.0f}",
+                        '당일Phase': info['Today_Phase'], '전일Phase': info['Yest_Phase'], 
+                        '손절(EMA20)': f"{info['EMA20']:,.0f}",
                         '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
+                        'Is_New': info['Is_New'], 
                         'BW_Value': "0", 'MACD_V_Value': "0" 
                     })
             bar.empty()
             if res:
-                st.success(f"[듀얼MA 돌파] Phase 1 또는 Phase 3 에 해당하는 {len(res)}개 종목 발견!")
-                st.dataframe(pd.DataFrame(res).drop(columns=['BW_Value', 'MACD_V_Value'], errors='ignore'))
+                df_res = pd.DataFrame(res)
+                # 정렬: 1순위(신규돌파 우선), 2순위(Phase 오름차순)
+                df_res = df_res.sort_values(by=['Is_New', '당일Phase'], ascending=[False, True])
+                
+                # 출력에 필요한 컬럼만 추출
+                display_cols = ['상태', '종목코드', '섹터', '현재가', '당일Phase', '전일Phase', '손절(EMA20)', '1W변화', '1M변화', '3M변화']
+                df_display = df_res[display_cols]
+                
+                st.success(f"[듀얼MA 돌파] 총 {len(res)}개 발견! (오늘 새롭게 돌파한 종목이 표 상단에 표시됩니다)")
+                st.dataframe(df_display, use_container_width=True)
+                
                 save_to_supabase(res, "Dual_MA_Breakout")
             else: st.warning("현재 Phase 1 또는 Phase 3 조건을 만족하는 종목이 없습니다.")
 

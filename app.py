@@ -1022,7 +1022,7 @@ with tab3:
         tickers = get_tickers_from_sheet()
         if not tickers: st.warning("종목 리스트(TGT) 없음")
         else:
-            st.info(f"구글 시트에서 총 **{len(tickers)}**개 종목을 불러왔습니다.")
+            st.info(f"구글 시트에서 총 **{len(tickers)}**개 종목을 불러왔습니다. (4단계 돌파 종목만 스크리닝 중...)")
             
             status_text = st.empty()
             bar = st.progress(0)
@@ -1046,8 +1046,9 @@ with tab3:
                 # 1. 오늘 기준 VCP 체크
                 passed, info = check_vcp_pattern(df)
                 
-                if passed:
-                    # [NEW] 2. 어제 기준 VCP 체크 (오늘 데이터 제외하고 분석)
+                # [핵심 변경] passed가 True이고, 비고(status)가 '4단계'를 포함할 때만 결과에 추가합니다.
+                if passed and "4단계" in info['status']:
+                    # 2. 어제 기준 VCP 체크 (오늘 데이터 제외하고 분석)
                     df_prev = df.iloc[:-1].copy() # 마지막 행(오늘) 제외
                     y_passed, y_info = check_vcp_pattern(df_prev)
                     prev_status = y_info['status'] if y_passed else "-"
@@ -1061,8 +1062,8 @@ with tab3:
                         '종목코드': final_ticker, 
                         '섹터': sector, 
                         '현재가': f"{info['price']:,.0f}",
-                        '비고': info['status'],       # 오늘의 단계
-                        '전일비고': prev_status,      # [추가됨] 어제의 단계
+                        '비고': info['status'],       # 오늘의 단계 (무조건 4단계)
+                        '전일비고': prev_status,      # 어제의 단계
                         '주봉MACD': weekly_macd_status, 
                         '손절가': f"{info['stop_loss']:,.0f}", 
                         '목표가(3R)': f"{info['target_price']:,.0f}",
@@ -1073,31 +1074,29 @@ with tab3:
             bar.empty()
             status_text.empty() 
             
-            st.success(f"✅ 분석 완료! 총 {count_total}개 전체 종목을 검사했습니다.")
+            st.success(f"✅ 분석 완료! 총 {count_total}개 종목 중 돌파(4단계) 종목을 찾았습니다.")
             
             if res:
-                df_res = pd.DataFrame(res).sort_values("비고", ascending=False)
+                df_res = pd.DataFrame(res)
                 
-                # [NEW] 컬럼 순서 재배치 (전일비고를 비고 옆으로)
+                # 컬럼 순서 재배치
                 cols_order = [
                     '종목코드', '섹터', '현재가', '비고', '전일비고', 
                     '주봉MACD', '손절가', '목표가(3R)', '스퀴즈', 
                     '1W변화', '1M변화', '3M변화', 'Pivot'
                 ]
-                # 존재하는 컬럼만 선택하여 에러 방지
                 final_cols = [c for c in cols_order if c in df_res.columns]
                 
                 st.dataframe(df_res[final_cols], use_container_width=True)
                 
-                breakout_targets = [r for r in res if "4단계" in r['비고']]
-
-                if breakout_targets:
+                # 결과 리스트(res)에 있는 종목은 모두 4단계이므로 바로 차트를 그려줍니다.
+                if res:
                     st.markdown("---")
                     st.markdown("### 🚀 돌파 종목 차트 갤러리 (Step 4)")
-                    for i in range(0, len(breakout_targets), 2):
+                    for i in range(0, len(res), 2):
                         c1, c2 = st.columns(2)
                         
-                        item1 = breakout_targets[i]
+                        item1 = res[i]
                         ticker1 = item1['종목코드']
                         if ticker1 in chart_data_cache:
                             cached1 = chart_data_cache[ticker1]
@@ -1105,8 +1104,8 @@ with tab3:
                             c1.plotly_chart(fig1, use_container_width=True)
                             c1.caption(f"**{ticker1}** ({item1['섹터']}) | {item1['주봉MACD']} | 전일:{item1['전일비고']}")
 
-                        if i + 1 < len(breakout_targets):
-                            item2 = breakout_targets[i+1]
+                        if i + 1 < len(res):
+                            item2 = res[i+1]
                             ticker2 = item2['종목코드']
                             if ticker2 in chart_data_cache:
                                 cached2 = chart_data_cache[ticker2]
@@ -1115,7 +1114,7 @@ with tab3:
                                 c2.caption(f"**{ticker2}** ({item2['섹터']}) | {item2['주봉MACD']} | 전일:{item2['전일비고']}")
                 
                 save_to_supabase(res, "VCP_Pattern")
-            else: st.warning("VCP 조건(추세+수렴)을 만족하는 종목이 없습니다.")
+            else: st.warning("현재 4단계(돌파) 조건을 만족하는 종목이 없습니다.")
 
     if cols[1].button("🚀 일봉"):
         tickers = get_tickers_from_sheet()

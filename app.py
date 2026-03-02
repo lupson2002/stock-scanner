@@ -1040,16 +1040,26 @@ with tab3:
 
                 if len(df) < 250: continue
 
+                # 1. 오늘 기준 VCP 체크
                 passed, info = check_vcp_pattern(df)
+                
                 if passed:
+                    # [NEW] 2. 어제 기준 VCP 체크 (오늘 데이터 제외하고 분석)
+                    df_prev = df.iloc[:-1].copy() # 마지막 행(오늘) 제외
+                    y_passed, y_info = check_vcp_pattern(df_prev)
+                    prev_status = y_info['status'] if y_passed else "-"
+
                     eps1w, eps1m, eps3m = get_eps_changes_from_db(final_ticker)
                     weekly_macd_status = get_weekly_macd_status(df)
                     sector = get_stock_sector(final_ticker)
                     chart_data_cache[final_ticker] = {'df': df, 'info': info}
                     
                     res.append({
-                        '종목코드': final_ticker, '섹터': sector, '현재가': f"{info['price']:,.0f}",
-                        '비고': info['status'], 
+                        '종목코드': final_ticker, 
+                        '섹터': sector, 
+                        '현재가': f"{info['price']:,.0f}",
+                        '비고': info['status'],       # 오늘의 단계
+                        '전일비고': prev_status,      # [추가됨] 어제의 단계
                         '주봉MACD': weekly_macd_status, 
                         '손절가': f"{info['stop_loss']:,.0f}", 
                         '목표가(3R)': f"{info['target_price']:,.0f}",
@@ -1064,7 +1074,17 @@ with tab3:
             
             if res:
                 df_res = pd.DataFrame(res).sort_values("비고", ascending=False)
-                st.dataframe(df_res, use_container_width=True)
+                
+                # [NEW] 컬럼 순서 재배치 (전일비고를 비고 옆으로)
+                cols_order = [
+                    '종목코드', '섹터', '현재가', '비고', '전일비고', 
+                    '주봉MACD', '손절가', '목표가(3R)', '스퀴즈', 
+                    '1W변화', '1M변화', '3M변화', 'Pivot'
+                ]
+                # 존재하는 컬럼만 선택하여 에러 방지
+                final_cols = [c for c in cols_order if c in df_res.columns]
+                
+                st.dataframe(df_res[final_cols], use_container_width=True)
                 
                 breakout_targets = [r for r in res if "4단계" in r['비고']]
 
@@ -1080,7 +1100,7 @@ with tab3:
                             cached1 = chart_data_cache[ticker1]
                             fig1 = plot_vcp_chart(cached1['df'], ticker1, cached1['info'])
                             c1.plotly_chart(fig1, use_container_width=True)
-                            c1.caption(f"**{ticker1}** ({item1['섹터']}) | {item1['주봉MACD']} | Pivot: {item1['Pivot']}")
+                            c1.caption(f"**{ticker1}** ({item1['섹터']}) | {item1['주봉MACD']} | 전일:{item1['전일비고']}")
 
                         if i + 1 < len(breakout_targets):
                             item2 = breakout_targets[i+1]
@@ -1089,7 +1109,7 @@ with tab3:
                                 cached2 = chart_data_cache[ticker2]
                                 fig2 = plot_vcp_chart(cached2['df'], ticker2, cached2['info'])
                                 c2.plotly_chart(fig2, use_container_width=True)
-                                c2.caption(f"**{ticker2}** ({item2['섹터']}) | {item2['주봉MACD']} | Pivot: {item2['Pivot']}")
+                                c2.caption(f"**{ticker2}** ({item2['섹터']}) | {item2['주봉MACD']} | 전일:{item2['전일비고']}")
                 
                 save_to_supabase(res, "VCP_Pattern")
             else: st.warning("VCP 조건(추세+수렴)을 만족하는 종목이 없습니다.")

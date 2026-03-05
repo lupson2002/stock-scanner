@@ -614,6 +614,7 @@ def check_monthly_condition(df):
         return True, {'price': curr_price, 'ath_price': ath_price, 'ath_date': ath_idx.strftime('%Y-%m'), 'month_count': month_count}
     return False, None
 
+# [UPDATE] 섹터 및 국가 탭에 대한 최종 모멘텀 스코어 (변동성 스케일링 적용)
 def analyze_momentum_strategy(target_list, type_name="ETF"):
     if not target_list: return pd.DataFrame()
     st.write(f"📊 총 {len(target_list)}개 {type_name} 분석 중...")
@@ -621,15 +622,29 @@ def analyze_momentum_strategy(target_list, type_name="ETF"):
     for i, (t, n) in enumerate(target_list):
         pbar.progress((i+1)/len(target_list))
         rt, df = smart_download(t, "1d", "2y")
-        if len(df)<30: continue
-        df = calculate_daily_indicators(df)
-        if df is None: continue
+        if len(df)<50: continue # BBW를 위해 최소 50일 필요
+        
+        # 일봉 지표 전체 계산
+        df_indicators = calculate_daily_indicators(df)
+        if df_indicators is None: continue
+        
         c = df['Close']; curr=c.iloc[-1]
-        squeeze_on = df['TTM_Squeeze'].iloc[-5:].any() if 'TTM_Squeeze' in df.columns else False
+        
+        # [UPDATE] BBW(ema 50, 2) 계산
+        ema50_bbw = c.ewm(span=50, adjust=False).mean()
+        std50_bbw = c.rolling(window=50).std()
+        bbw = (4 * std50_bbw) / ema50_bbw
+        curr_bbw = bbw.iloc[-1]
+        
+        # 0 나누기 방지
+        if pd.isna(curr_bbw) or curr_bbw <= 0: 
+            curr_bbw = 0.001
+
+        squeeze_on = df_indicators['TTM_Squeeze'].iloc[-5:].any() if 'TTM_Squeeze' in df_indicators.columns else False
         ema20=c.ewm(span=20).mean(); ema50=c.ewm(span=50).mean(); ema60=c.ewm(span=60).mean()
         ema100=c.ewm(span=100).mean(); ema200=c.ewm(span=200).mean()
-        bb_up = df['BB50_UP']; dc_h = df['Donchian_High_50'] 
-        macdv = df['MACD_V']; atr = df['ATR14'].iloc[-1]
+        bb_up = df_indicators['BB50_UP']; dc_h = df_indicators['Donchian_High_50'] 
+        macdv = df_indicators['MACD_V']; atr = df_indicators['ATR14'].iloc[-1]
         bb_bk = "O" if (c>bb_up).iloc[-3:].any() else "-"
         dc_bk = "O" if (c>dc_h).iloc[-3:].any() else "-"
         align = "⭐ 정배열" if (curr>ema20.iloc[-1] and curr>ema60.iloc[-1] and curr>ema100.iloc[-1] and curr>ema200.iloc[-1]) else "-"
@@ -637,11 +652,14 @@ def analyze_momentum_strategy(target_list, type_name="ETF"):
         
         r12 = c.pct_change(252).iloc[-1] if len(c) > 252 else 0
         r6  = c.pct_change(126).iloc[-1] if len(c) > 126 else 0
-        r3  = c.pct_change(63).iloc[-1] if len(c) > 63 else 0
-        r1  = c.pct_change(21).iloc[-1] if len(c) > 21 else 0
+        r3  = c.pct_change(63).iloc[-1]  if len(c) > 63 else 0
+        r1  = c.pct_change(21).iloc[-1]  if len(c) > 21 else 0
         
         avg_long_term = (r12 + r6) / 2
-        score = ((avg_long_term - r3) + r1) * 100
+        # [UPDATE] 순수 모멘텀 스코어 
+        pure_score = ((avg_long_term - r3) + r1) * 100
+        # [UPDATE] 최종 모멘텀 스코어 (변동성 스케일링)
+        final_score = pure_score / curr_bbw
         
         if len(df) >= 252:
             win_52 = df.iloc[-252:]
@@ -656,9 +674,11 @@ def analyze_momentum_strategy(target_list, type_name="ETF"):
                 prev_date = "-"; diff_days = 0
         else:
             high_52_date = "-"; prev_date = "-"; diff_days = 0
+            
         results.append({
             f"{type_name}": f"{rt} ({n})", 
-            "모멘텀점수": score, 
+            "최종모멘텀스코어": final_score,     # [UPDATE] 정렬 기준
+            "순수모멘텀스코어": pure_score,      # [UPDATE] 추가 열
             "스퀴즈": "🔥" if squeeze_on else "-", 
             "BB(50,2)돌파": bb_bk, 
             "돈키언(50)돌파": dc_bk, 
@@ -673,8 +693,10 @@ def analyze_momentum_strategy(target_list, type_name="ETF"):
         })
     pbar.empty()
     if results:
-        df_res = pd.DataFrame(results).sort_values("모멘텀점수", ascending=False)
-        df_res['모멘텀점수'] = df_res['모멘텀점수'].apply(lambda x: f"{x:.2f}")
+        # [UPDATE] 최종모멘텀스코어 기준 내림차순 정렬
+        df_res = pd.DataFrame(results).sort_values("최종모멘텀스코어", ascending=False)
+        df_res['최종모멘텀스코어'] = df_res['최종모멘텀스코어'].apply(lambda x: f"{x:.2f}")
+        df_res['순수모멘텀스코어'] = df_res['순수모멘텀스코어'].apply(lambda x: f"{x:.2f}")
         df_res['현재가'] = df_res['현재가'].apply(lambda x: f"{x:,.2f}")
         return df_res
     return pd.DataFrame()
@@ -711,6 +733,7 @@ def check_inverse_hs_pattern(df):
     vol_ratio = vol_recent / vol_prev if vol_prev > 0 else 1.0
     return True, {"Neckline": f"{max_R:,.0f}", "Breakout": "Ready" if curr_close < max_R else "Yes", "Vol_Ratio": f"{vol_ratio:.1f}배"}
 
+# [UPDATE] 나침판 신호 변동성 스케일링 적용
 def get_compass_signal():
     OFFENSE = ["QQQ", "SCHD", "IMTM", "GLD", "EMGF"]
     CASH = "BIL"
@@ -721,6 +744,21 @@ def get_compass_signal():
         if data.empty: return None, "데이터 없음"
     except:
         return None, "다운로드 실패"
+
+    # [UPDATE] BBW 계산 (일별 데이터를 바탕으로 현재 시점 BBW 도출)
+    bbw_dict = {}
+    for ticker in OFFENSE:
+        try:
+            c = data[ticker].dropna()
+            if len(c) >= 50:
+                ema50 = c.ewm(span=50, adjust=False).mean()
+                std50 = c.rolling(50).std()
+                bbw = (4 * std50) / ema50
+                bbw_dict[ticker] = bbw.iloc[-1] if not pd.isna(bbw.iloc[-1]) and bbw.iloc[-1] > 0 else 0.001
+            else:
+                bbw_dict[ticker] = 0.001
+        except:
+            bbw_dict[ticker] = 0.001
 
     monthly_data = data.resample('ME').last()
     if len(monthly_data) < 13: return None, "데이터 부족 (최소 13개월 필요)"
@@ -740,19 +778,26 @@ def get_compass_signal():
         if np.isnan(r12): continue
         
         avg_long = (r12 + r6) / 2
-        score = (avg_long - r3) + r1
+        
+        # [UPDATE] 순수 모멘텀 스코어 및 최종 스코어 계산
+        pure_score = ((avg_long - r3) + r1) * 100
+        curr_bbw = bbw_dict.get(ticker, 0.001)
+        final_score = pure_score / curr_bbw
+        
         scores[ticker] = {
-            "Score": score * 100,
+            "최종스코어": final_score,
+            "순수스코어": pure_score,
             "12M_Trend": r12 
         }
     
     if not scores: return None, "계산 불가"
 
     df_scores = pd.DataFrame(scores).T
-    df_scores = df_scores.sort_values("Score", ascending=False)
+    # [UPDATE] 최종스코어로 정렬
+    df_scores = df_scores.sort_values("최종스코어", ascending=False)
     
     best_ticker = df_scores.index[0]
-    best_score = df_scores.iloc[0]['Score']
+    best_score = df_scores.iloc[0]['최종스코어']
     best_trend = df_scores.iloc[0]['12M_Trend']
     
     final_position = best_ticker if (best_score > 0 and best_trend > 0) else CASH
@@ -765,6 +810,21 @@ def fetch_korean_etf_data(ticker, name):
     time.sleep(random.uniform(0.05, 0.25))
     url = f"https://finance.naver.com/item/coinfo.naver?code={ticker}"
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    
+    # [UPDATE] BBW 계산을 위해 fdr에서 과거 일봉 데이터를 받아옵니다.
+    curr_bbw = 0.001
+    try:
+        df_daily = fdr.DataReader(ticker).tail(100)
+        if len(df_daily) >= 50:
+            c = df_daily['Close']
+            ema50 = c.ewm(span=50, adjust=False).mean()
+            std50 = c.rolling(50).std()
+            bbw = (4 * std50) / ema50
+            if not pd.isna(bbw.iloc[-1]) and bbw.iloc[-1] > 0:
+                curr_bbw = bbw.iloc[-1]
+    except Exception:
+        pass
+
     try:
         res = requests.get(url, headers=headers, timeout=5)
         res.encoding = 'euc-kr' 
@@ -792,13 +852,15 @@ def fetch_korean_etf_data(ticker, name):
         return {
             'Symbol': ticker, 'Name': name,
             '1M_Return(%)': ret_1m, '3M_Return(%)': ret_3m,
-            '6M_Return(%)': ret_6m, '12M_Return(%)': ret_12m
+            '6M_Return(%)': ret_6m, '12M_Return(%)': ret_12m,
+            'BBW': curr_bbw # [UPDATE] BBW 값 추가
         }
     except Exception as e:
         return {
             'Symbol': ticker, 'Name': name,
             '1M_Return(%)': None, '3M_Return(%)': None, 
-            '6M_Return(%)': None, '12M_Return(%)': None
+            '6M_Return(%)': None, '12M_Return(%)': None,
+            'BBW': curr_bbw
         }
 
 def run_korean_etf_analysis():
@@ -828,13 +890,20 @@ def run_korean_etf_analysis():
     status_text.empty()
     
     df_returns = pd.DataFrame(results)
-    df_returns['Momentum_Score'] = (
+    
+    # [UPDATE] 순수 모멘텀 스코어 및 최종 모멘텀 스코어 계산
+    df_returns['순수모멘텀스코어'] = (
         0.5 * (df_returns['12M_Return(%)'] + df_returns['6M_Return(%)']) 
         - df_returns['3M_Return(%)'] 
         + df_returns['1M_Return(%)']
     )
     
-    df_returns = df_returns.dropna(subset=['Momentum_Score']).sort_values(by='Momentum_Score', ascending=False).reset_index(drop=True)
+    df_returns['최종모멘텀스코어'] = df_returns['순수모멘텀스코어'] / df_returns['BBW']
+    
+    df_returns = df_returns.dropna(subset=['최종모멘텀스코어']).sort_values(by='최종모멘텀스코어', ascending=False).reset_index(drop=True)
+    
+    # BBW 컬럼은 깔끔한 UI를 위해 제외하거나 원하시면 유지 가능합니다 (현재는 표시에 방해될 수 있어 drop)
+    df_returns = df_returns.drop(columns=['BBW'], errors='ignore')
     return df_returns
 
 
@@ -929,7 +998,7 @@ with tab_compass:
     
     **전략 로직:**
     1. **후보군:** QQQ(나스닥), SCHD(배당성장), IMTM(선진국모멘텀), GLD(금), EMGF(신흥국멀티팩터)
-    2. **점수 산출:** `((12개월+6개월)/2 - 3개월) + 1개월` 수익률
+    2. **점수 산출:** `((12개월+6개월)/2 - 3개월) + 1개월` 수익률을 `BBW(ema50, 2)`로 나누어 변동성 스케일링 적용
     3. **방어 기제:** 1등 종목의 12개월 수익률이 마이너스면 **현금(BIL)** 보유
     """)
     
@@ -947,22 +1016,24 @@ with tab_compass:
                         st.caption(f"🚀 상승 모멘텀이 가장 강한 **{position}**에 올라타세요!")
                 
                 with col2:
-                    top_score = df_result.iloc[0]['Score']
-                    st.metric("1등 모멘텀 점수", f"{top_score:.2f}점")
+                    top_score = df_result.iloc[0]['최종스코어']
+                    st.metric("1등 최종 모멘텀 점수", f"{top_score:.2f}점")
 
                 st.markdown("---")
                 st.markdown("#### 📊 자산별 상세 스코어 (높은 순)")
                 
                 df_display = df_result.copy()
-                df_display['Score'] = df_display['Score'].apply(lambda x: f"{x:.2f}")
+                df_display['최종스코어'] = df_display['최종스코어'].apply(lambda x: f"{x:.2f}")
+                df_display['순수스코어'] = df_display['순수스코어'].apply(lambda x: f"{x:.2f}")
                 df_display['12M_Trend'] = df_display['12M_Trend'].apply(lambda x: f"{x*100:.1f}%")
-                df_display.columns = ["모멘텀 점수", "12개월 추세(절대)"]
+                # [UPDATE] 컬럼명 변경
+                df_display.columns = ["최종 모멘텀 점수 (스케일링)", "순수 모멘텀 점수", "12개월 추세(절대)"]
                 
                 st.dataframe(df_display, use_container_width=True)
                 
                 st.info("""
                 **해석 가이드:**
-                * **모멘텀 점수:** 높을수록 상승세가 견고하고 최근 눌림목을 잘 소화한 종목입니다.
+                * **최종 모멘텀 점수:** 높을수록 변동성 대비 상승세가 견고하고 최근 눌림목을 잘 소화한 종목입니다.
                 * **12개월 추세:** 이 값이 마이너스(-)라면, 점수가 아무리 높아도 **하락장**으로 간주하여 현금(BIL)을 추천합니다.
                 """)
             else:

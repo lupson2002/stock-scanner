@@ -145,9 +145,13 @@ def remove_duplicates_from_db():
 def smart_download(ticker, interval="1d", period="2y"):
     if ':' in ticker: ticker = ticker.split(':')[-1]
     ticker = ticker.replace('/', '-')
-    candidates = [ticker]
-    if ticker.isdigit() and len(ticker) == 6:
-        candidates = [f"{ticker}.KS", f"{ticker}.KQ", ticker]
+    
+    # [수정] yfinance에서 오류를 방지하기 위해 공백을 하이픈으로 변경 (예: BRK B -> BRK-B)
+    ticker_yf = ticker.replace(' ', '-')
+    
+    candidates = [ticker_yf]
+    if ticker_yf.isdigit() and len(ticker_yf) == 6:
+        candidates = [f"{ticker_yf}.KS", f"{ticker_yf}.KQ", ticker_yf]
     
     for t in candidates:
         try:
@@ -156,6 +160,9 @@ def smart_download(ticker, interval="1d", period="2y"):
                 if len(df) > 0:
                     if isinstance(df.columns, pd.MultiIndex):
                         df.columns = df.columns.get_level_values(0)
+                    
+                    # [수정 핵심] 중복된 컬럼이 생성되었을 경우 첫 번째 컬럼만 남기고 모두 제거하여 에러 방지
+                    df = df.loc[:, ~df.columns.duplicated()].copy()
                     return t, df
                 time.sleep(0.3)
         except:
@@ -524,6 +531,9 @@ def check_daily_condition(df):
 def check_weekly_condition(df):
     if len(df) < 40: return False, None
     
+    # [수정] 원본 데이터 손상을 막기 위해 사본을 명시적으로 생성합니다.
+    df = df.copy()
+    
     df['SMA30'] = df['Close'].rolling(window=30).mean()
     df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
     
@@ -606,6 +616,7 @@ def check_weekly_condition(df):
 
 def check_monthly_condition(df):
     if len(df) < 12: return False, None
+    df = df.copy()
     ath_price = df['High'].max()
     curr_price = df['Close'].iloc[-1]
     if curr_price >= ath_price * 0.90:

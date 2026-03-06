@@ -10,10 +10,10 @@ import time
 import random
 import concurrent.futures
 import re
+import requests # [핵심] 독립 세션 생성을 위해 필수
 
 # [NEW] 한국 ETF 스크래핑용 추가 라이브러리
 import FinanceDataReader as fdr
-import requests
 from bs4 import BeautifulSoup
 
 # =========================================================
@@ -141,7 +141,7 @@ def remove_duplicates_from_db():
     except Exception as e:
         st.error(f"중복 제거 실패: {e}")
 
-# [핵심 최적화 1] 메모리 캐싱 적용 + yfinance 오류 방지 지연율(Jitter) 적용
+# 🔥 [핵심 최적화 1] 독립 세션(Session) 분리 및 yfinance IP 차단 우회
 @st.cache_data(ttl=3600*24, show_spinner=False)
 def smart_download(ticker, interval="1d", period="2y"):
     if ':' in ticker: ticker = ticker.split(':')[-1]
@@ -151,11 +151,18 @@ def smart_download(ticker, interval="1d", period="2y"):
     candidates = [ticker_yf]
     if ticker_yf.isdigit() and len(ticker_yf) == 6:
         candidates = [f"{ticker_yf}.KS", f"{ticker_yf}.KQ", ticker_yf]
+        
+    # [수정] yfinance 전용 세션을 만들어 일반 사용자의 웹 브라우저처럼 위장합니다.
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
+    })
     
     for t in candidates:
         for attempt in range(3):
             try:
-                df = yf.download(t, period=period, interval=interval, progress=False, auto_adjust=False)
+                # session 파라미터 전달
+                df = yf.download(t, period=period, interval=interval, progress=False, auto_adjust=False, session=session)
                 if len(df) > 0:
                     if isinstance(df.columns, pd.MultiIndex):
                         df.columns = df.columns.get_level_values(0)
@@ -163,8 +170,8 @@ def smart_download(ticker, interval="1d", period="2y"):
                     return t, df
             except:
                 pass
-            # 요청 과부하 방지를 위해 실패시 랜덤한 시간 휴식 (IP 밴 방어)
-            time.sleep(random.uniform(0.1, 0.4))
+            # 요청 실패 시 대기 시간을 충분히(0.5~1.2초) 주어 서버가 공격으로 인지하지 못하게 방어합니다.
+            time.sleep(random.uniform(0.5, 1.2))
     return ticker, pd.DataFrame()
 
 @st.cache_data(ttl=3600*24, show_spinner=False) 
@@ -176,7 +183,7 @@ def get_ticker_info_safe(ticker):
                 meta = tick.info
                 if meta: return meta
             except:
-                time.sleep(random.uniform(0.1, 0.4))
+                time.sleep(random.uniform(0.5, 1.2))
         return None
     except:
         return None
@@ -276,10 +283,10 @@ def get_eps_changes_from_db(ticker):
     return "-", "-", "-"
 
 # ==========================================
-# [핵심 최적화 2] 스트림릿 UI 충돌을 방지하는 안전한 병렬 실행기
+# 🚀 [핵심 최적화 2] 스트림릿 UI 충돌을 방지하는 안전한 병렬 실행기
 # ==========================================
-def run_concurrent_analysis(func, items, max_workers=5):
-    """지정된 함수(func)를 items 리스트에 대해 병렬로 실행하고 진행률 바를 업데이트합니다."""
+def run_concurrent_analysis(func, items, max_workers=3):
+    """지정된 함수(func)를 items 리스트에 대해 병렬로 실행합니다. 기본 max_workers=3으로 하향 조정"""
     results = []
     if not items: return results
     
@@ -287,7 +294,6 @@ def run_concurrent_analysis(func, items, max_workers=5):
     status_text = st.empty()
     total = len(items)
     
-    # yfinance Rate Limit 이슈 회피를 위해 max_workers는 5~6 정도로 유지
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_item = {executor.submit(func, item): item for item in items}
         
@@ -297,9 +303,8 @@ def run_concurrent_analysis(func, items, max_workers=5):
                 if res is not None:
                     results.append(res)
             except Exception as e:
-                pass # 백그라운드 스레드의 예외는 무시하고 계속 진행
+                pass 
             
-            # UI 업데이트는 안전하게 메인 스레드에서만 진행
             progress_bar.progress((i + 1) / total)
             status_text.text(f"🚀 병렬 분석 진행 중... ({i+1}/{total})")
             
@@ -418,9 +423,9 @@ def check_vcp_pattern(df):
 
     window = 60
     subset = df.iloc[-window:]
-    p1 = subset.iloc[:20]    # 20일
-    p2 = subset.iloc[20:40]  # 20일
-    p3 = subset.iloc[40:]    # 20일
+    p1 = subset.iloc[:20]    
+    p2 = subset.iloc[20:40]  
+    p3 = subset.iloc[40:]    
     
     range1 = (p1['High'].max() - p1['Low'].min()) / p1['High'].max()
     range2 = (p2['High'].max() - p2['Low'].min()) / p2['High'].max()
@@ -727,7 +732,8 @@ def analyze_momentum_strategy(target_list, type_name="ETF"):
             "현재가": curr
         }
         
-    results = run_concurrent_analysis(process_item, target_list, max_workers=5)
+    # [수정] yfinance 통신이 포함되므로 max_workers=3 으로 유지
+    results = run_concurrent_analysis(process_item, target_list, max_workers=3)
     
     if results:
         df_res = pd.DataFrame(results)
@@ -793,7 +799,10 @@ def get_compass_signal():
     ALL_TICKERS = list(set(OFFENSE + [CASH]))
     
     try:
-        data = yf.download(ALL_TICKERS, period="2y", progress=False, auto_adjust=False)['Close']
+        # [수정] yfinance 통신 시 단일 다운로드도 약간의 지연 부여
+        session = requests.Session()
+        session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
+        data = yf.download(ALL_TICKERS, period="2y", progress=False, auto_adjust=False, session=session)['Close']
         if data.empty: return None, "데이터 없음"
     except:
         return None, "다운로드 실패"
@@ -938,7 +947,7 @@ def run_korean_etf_analysis():
     
     items_to_fetch = list(zip(tickers, names))
     
-    # 여기서는 requests 통신이므로 스레드를 약간 올려도 괜찮음 (8)
+    # [수정] 네이버 스크래핑은 yfinance가 아니므로 속도를 위해 max_workers=8 유지
     results = run_concurrent_analysis(lambda item: fetch_korean_etf_data(item[0], item[1]), items_to_fetch, max_workers=8)
     
     df_returns = pd.DataFrame(results)
@@ -1174,7 +1183,8 @@ with tab3:
                     return res_dict, chart_dict
                 return None
 
-            results = run_concurrent_analysis(process_vcp, tickers, max_workers=5)
+            # [수정] yfinance 통신이므로 max_workers=3 적용
+            results = run_concurrent_analysis(process_vcp, tickers, max_workers=3)
             res = []
             chart_data_cache = {}
             for r in results:
@@ -1240,7 +1250,8 @@ with tab3:
                     }
                 return None
                 
-            res = run_concurrent_analysis(process_daily, tickers, max_workers=5)
+            # [수정] yfinance 통신이므로 max_workers=3 적용
+            res = run_concurrent_analysis(process_daily, tickers, max_workers=3)
             if res:
                 st.success(f"[일봉] {len(res)}개 발견!")
                 st.dataframe(pd.DataFrame(res).drop(columns=['BW_Value', 'MACD_V_Value']))
@@ -1266,7 +1277,7 @@ with tab3:
                     }
                 return None
             
-            res = run_concurrent_analysis(process_weekly, tickers, max_workers=5)
+            res = run_concurrent_analysis(process_weekly, tickers, max_workers=3)
             if res:
                 st.success(f"[주봉] {len(res)}개 발견!")
                 st.dataframe(pd.DataFrame(res).drop(columns=['BW_Value', 'MACD_V_Value']))
@@ -1293,7 +1304,7 @@ with tab3:
                     }
                 return None
                 
-            res = run_concurrent_analysis(process_monthly, tickers, max_workers=5)
+            res = run_concurrent_analysis(process_monthly, tickers, max_workers=3)
             if res:
                 st.success(f"[월봉] {len(res)}개 발견!")
                 st.dataframe(pd.DataFrame(res).drop(columns=['현52주신고가일', 'BW_Value', 'MACD_V_Value'], errors='ignore'))
@@ -1324,7 +1335,7 @@ with tab3:
                     '차이일': f"{info_d['diff_days']}일", 'BW_Value': str(info_m['month_count']), 'MACD_V_Value': f"{info_d['macdv']:.2f}"
                 }
                 
-            res = run_concurrent_analysis(process_daily_monthly, tickers, max_workers=5)
+            res = run_concurrent_analysis(process_daily_monthly, tickers, max_workers=3)
             if res:
                 st.success(f"[일+월봉] {len(res)}개 발견!")
                 st.dataframe(pd.DataFrame(res))
@@ -1354,7 +1365,7 @@ with tab3:
                     '차이일': f"{info_d['diff_days']}일", 'BW_Value': f"{info_w['bw_curr']:.4f}", 'MACD_V_Value': f"{info_d['macdv']:.2f}"
                 }
                 
-            res = run_concurrent_analysis(process_daily_weekly, tickers, max_workers=5)
+            res = run_concurrent_analysis(process_daily_weekly, tickers, max_workers=3)
             if res:
                 st.success(f"[일+주봉] {len(res)}개 발견!")
                 st.dataframe(pd.DataFrame(res))
@@ -1384,7 +1395,7 @@ with tab3:
                     '현52주신고가일': info_m['ath_date'], 'BW_Value': f"{info_w['bw_curr']:.4f}", 'MACD_V_Value': f"{info_w['macdv']:.2f}"
                 }
                 
-            res = run_concurrent_analysis(process_weekly_monthly, tickers, max_workers=5)
+            res = run_concurrent_analysis(process_weekly_monthly, tickers, max_workers=3)
             if res:
                 st.success(f"[주+월봉] {len(res)}개 발견!")
                 st.dataframe(pd.DataFrame(res))
@@ -1420,7 +1431,7 @@ with tab3:
                     'BW_Value': f"{info_w['bw_curr']:.4f}", 'MACD_V_Value': f"{info_w['macdv']:.2f}"
                 }
                 
-            res = run_concurrent_analysis(process_integrated, tickers, max_workers=5)
+            res = run_concurrent_analysis(process_integrated, tickers, max_workers=3)
             if res:
                 st.success(f"⚡ 통합 분석 완료! {len(res)}개 발견")
                 st.dataframe(pd.DataFrame(res).drop(columns=['BW_Value', 'MACD_V_Value']))
@@ -1449,7 +1460,7 @@ with tab3:
                     }
                 return None
                 
-            res = run_concurrent_analysis(process_dual_ma, tickers, max_workers=5)
+            res = run_concurrent_analysis(process_dual_ma, tickers, max_workers=3)
             if res:
                 df_res = pd.DataFrame(res)
                 df_res = df_res.sort_values(by=['당일Phase'], ascending=[True])
@@ -1483,7 +1494,7 @@ with tab3:
                     }
                 return None
                 
-            res = run_concurrent_analysis(process_cup_handle, tickers, max_workers=5)
+            res = run_concurrent_analysis(process_cup_handle, tickers, max_workers=3)
             if res:
                 st.success(f"[컵핸들] {len(res)}개 발견!")
                 st.dataframe(pd.DataFrame(res))
@@ -1512,7 +1523,7 @@ with tab3:
                     }
                 return None
                 
-            res = run_concurrent_analysis(process_inverse_hs, tickers, max_workers=5)
+            res = run_concurrent_analysis(process_inverse_hs, tickers, max_workers=3)
             if res:
                 st.success(f"[역H&S] {len(res)}개 발견!")
                 st.dataframe(pd.DataFrame(res))
@@ -1547,7 +1558,7 @@ with tab3:
                         }
                 except: return None
                 
-            res = run_concurrent_analysis(process_history, db_tickers, max_workers=5)
+            res = run_concurrent_analysis(process_history, db_tickers, max_workers=3)
             if res:
                 st.success(f"{len(res)}개 발견!")
                 st.dataframe(pd.DataFrame(res), use_container_width=True)
@@ -1563,7 +1574,6 @@ with tab4:
                 real_ticker, _ = smart_download(t, "1d", "5d") 
                 try:
                     tick = yf.Ticker(real_ticker)
-                    # 캐시를 통한 안전한 정보 호출
                     info = get_ticker_info_safe(real_ticker)
                     if not info: return None
                     
@@ -1605,7 +1615,7 @@ with tab4:
                 except Exception as e: return None
 
             st.info("재무제표 데이터 통신을 병렬로 처리합니다. (잠시만 기다려주세요)")
-            f_res = run_concurrent_analysis(process_financial, tickers, max_workers=5)
+            f_res = run_concurrent_analysis(process_financial, tickers, max_workers=3)
             
             if f_res:
                 df_fin = pd.DataFrame(f_res)

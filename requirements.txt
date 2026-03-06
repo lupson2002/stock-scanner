@@ -9,3 +9,4 @@ requests
 plotly
 finance-datareader
 beautifulsoup4
+finvizfinance

@@ -76,7 +76,7 @@ def remove_duplicates_from_db():
             st.success(f"🧹 중복 데이터 {len(ids_to_remove)}개 삭제 완료.")
     except Exception as e: st.error(f"중복 제거 실패: {e}")
 
-# [핵심] 병렬 처리 시 데이터 꼬임 방지(독립 세션 사용)
+# 병렬 처리 시 데이터 꼬임 방지(독립 세션 사용)
 def smart_download(ticker, interval="1d", period="2y"):
     t_str = str(ticker).split(':')[-1].replace('/', '-').replace(' ', '-')
     cands = [f"{t_str}.KS", f"{t_str}.KQ", t_str] if t_str.isdigit() and len(t_str)==6 else [t_str]
@@ -123,6 +123,16 @@ def save_to_supabase(data_list, strategy_name):
         st.toast(f"✅ {len(rows)}개 종목 DB 저장 완료!", icon="💾")
     except: pass
 
+def normalize_ticker_for_db_storage(t):
+    if not t: return ""
+    t_str = str(t).upper().strip()
+    if t_str.endswith("-US"): return t_str[:-3].replace('.', '-')
+    if t_str.endswith("-HK"): return t_str[:-3] + ".HK"
+    if t_str.endswith("-JP"): return t_str[:-3] + ".T"
+    if t_str.endswith("-KS") or t_str.endswith("-KQ"): return t_str[:-3]
+    if '-' in t_str and not any(x in t_str for x in ['-US','-HK','-JP','-KS','-KQ']): return t_str.split('-')[0]
+    return t_str
+
 @st.cache_data(ttl=600) 
 def fetch_latest_quant_data_from_db():
     if not supabase: return {}
@@ -144,11 +154,10 @@ def get_eps_changes_from_db(ticker):
         return d['1w'], d['1m'], d['3m']
     return "-", "-", "-"
 
-# [핵심] KRX 에러 처리 및 Finviz 차단 우회(FDR 미국주식 활용)
+# KRX 에러 처리 및 Finviz 차단 우회(FDR 미국주식 활용)
 @st.cache_data(ttl=86400)
 def get_top_marketcap_tickers():
     tickers, errors = [], []
-    # 1. 한국 주식 (KRX 에러 시 코스피/코스닥 우회)
     try:
         df_krx = fdr.StockListing('KRX')
         if not df_krx.empty and 'Marcap' in df_krx.columns:
@@ -159,7 +168,6 @@ def get_top_marketcap_tickers():
             if 'Marcap' in df_k.columns: tickers.extend(df_k.sort_values('Marcap', ascending=False).head(400)['Code'].tolist())
         except Exception as e2: errors.append(f"KRX/KOSPI 수집 실패: {e2}")
 
-    # 2. 미국 주식 (Finviz 403 차단 방지 -> FDR S&P500 + NASDAQ 활용)
     try:
         df_sp = fdr.StockListing('SP500')
         df_ndq = fdr.StockListing('NASDAQ')
@@ -167,7 +175,6 @@ def get_top_marketcap_tickers():
         tickers.extend(us_tickers[:1000])
     except Exception as e: errors.append(f"미국주식(FDR) 수집 실패: {e}")
 
-    # 3. 미국 ETF (이건 Finviz 외엔 답이 없으므로 시도하되 실패시 조용히 넘김)
     try:
         e = Overview(); e.set_filter(filters_dict={'Industry': 'Exchange Traded Fund'})
         tickers.extend(e.screener_view(order='Market Cap', ascend=False).head(400)['Ticker'].tolist())
@@ -176,7 +183,7 @@ def get_top_marketcap_tickers():
     return sorted(list(set(tickers))), errors
 
 # ==========================================
-# 3. 지표 및 전략 알고리즘 (복구 완료)
+# 3. 지표 및 전략 알고리즘
 # ==========================================
 def calculate_macdv(df, short=12, long=26, signal=9):
     ef, es = df['Close'].ewm(span=short, adjust=False).mean(), df['Close'].ewm(span=long, adjust=False).mean()
@@ -215,7 +222,6 @@ def check_vcp_pattern(df):
     curr = df.iloc[-1]
     s50, s150, s200 = df['SMA50'].iloc[-1], df['Close'].rolling(150).mean().iloc[-1], df['EMA200'].iloc[-1]
     
-    # [핵심] 질문자님 원본 VCP 조건 100% 복구 (cond3 제거)
     cond1 = curr['Close'] > s150 and curr['Close'] > s200
     cond2 = s150 > s200
     cond4 = s50 > s150
@@ -368,7 +374,7 @@ def check_inverse_hs_pattern(df):
     return True, {"Neckline": f"{xR:,.0f}", "Breakout": "Yes" if df['Close'].iloc[-1] > xR else "Ready", "Vol_Ratio": f"{p3['Volume'].mean() / (p2['Volume'].mean()+1e-9):.1f}배"}
 
 # ==========================================
-# 4. 모멘텀 전략 및 병렬 처리기 (복구 완료)
+# 4. 모멘텀 전략 및 병렬 처리기
 # ==========================================
 def _single_momentum(item, type_name):
     t, n = item
@@ -532,7 +538,7 @@ with tab_compass:
 with tab1:
     cols1 = st.columns(12) 
     if cols1[0].button("🌍 섹터"):
-        etfs = get_etfs_from_csv(ETF_CSV_URL, is_etf=True)
+        etfs = get_tickers_from_csv(ETF_CSV_URL, is_etf=True)
         if etfs: st.dataframe(analyze_momentum_parallel(etfs, "ETF"), use_container_width=True)
     if cols1[1].button("🇰🇷 한국ETF"):
         st.info("한국 상장 ETF 리스트 병렬 분석 중...")
@@ -543,7 +549,7 @@ with tab1:
 
 with tab2:
     if st.button("🏳️ 국가 ETF 분석"):
-        ctrys = get_etfs_from_csv(COUNTRY_CSV_URL, is_etf=True)
+        ctrys = get_tickers_from_csv(COUNTRY_CSV_URL, is_etf=True)
         if ctrys: st.dataframe(analyze_momentum_parallel(ctrys, "국가ETF"), use_container_width=True)
 
 with tab3:
@@ -761,10 +767,97 @@ with tab4:
         if f_res: st.dataframe(pd.DataFrame(f_res))
 
 with tab5:
-    st.markdown("### 📂 엑셀 데이터 매칭")
-    uploaded_file = st.file_uploader("📥 quant_master.xlsx 업로드", type=['xlsx'])
-    if uploaded_file and st.button("🔄 매칭 시작"):
+    st.markdown("### 📂 엑셀 데이터 매칭 (퀀티와이즈 DB 연동)")
+    col_upload, col_reset = st.columns([3, 1])
+    with col_upload:
+        uploaded_file = st.file_uploader("📥 quant_master.xlsx 파일을 업로드하세요", type=['xlsx'])
+    with col_reset:
+        st.write("") 
+        st.write("") 
+        if st.button("🗑️ DB 초기화 (전체 삭제)", type="primary"):
+            try:
+                supabase.table("quant_data").delete().neq("id", 0).execute()
+                st.success("DB가 초기화되었습니다.")
+                fetch_latest_quant_data_from_db.clear()
+            except Exception as e: st.error(f"초기화 실패: {e}")
+
+    show_debug_log = st.checkbox("🔍 디버깅 로그 보기")
+
+    def parse_sheet_ticker_value(sheet_df, allowed_tickers, debug_mode=False):
+        extracted = {}
+        for index, row in sheet_df.iterrows():
+            try:
+                raw_ticker = str(row[0]).strip()
+                if not raw_ticker or raw_ticker.lower() in ['code', 'ticker', 'nan', 'item type', 'comparison date']: continue
+                norm_ticker = normalize_ticker_for_db_storage(raw_ticker)
+                if norm_ticker not in allowed_tickers: continue
+                val = row[3] 
+                final_val = "-" if pd.isna(val) else str(val).strip()
+                if final_val.lower() == 'nan' or final_val == "": final_val = "-"
+                extracted[norm_ticker] = final_val
+            except Exception: continue
+        return extracted
+
+    if uploaded_file and st.button("🔄 DB 업로드 및 분석 시작"):
         try:
+            tgt_stocks = get_tickers_from_csv(STOCK_CSV_URL)
+            tgt_etfs = [x[0] for x in get_tickers_from_csv(ETF_CSV_URL, is_etf=True)]
+            tgt_countries = [x[0] for x in get_tickers_from_csv(COUNTRY_CSV_URL, is_etf=True)]
+            raw_targets = set(tgt_stocks + tgt_etfs + tgt_countries)
+            allowed_db_tickers = {t.split('.')[0].split('-')[0] for t in raw_targets}
+            
             xls = pd.read_excel(uploaded_file, sheet_name=None, header=None, dtype=str)
-            st.success("엑셀 파일을 성공적으로 읽었습니다. (DB 연동 기능은 정상 작동합니다)")
-        except Exception as e: st.error(f"오류: {e}")
+            sheet_map = {'1w': None, '1m': None, '3m': None}
+            for sheet_name in xls.keys():
+                s_name = sheet_name.lower().strip()
+                if '1w' in s_name: sheet_map['1w'] = xls[sheet_name]
+                elif '1m' in s_name: sheet_map['1m'] = xls[sheet_name]
+                elif '3m' in s_name: sheet_map['3m'] = xls[sheet_name]
+            
+            if not all(sheet_map.values()):
+                st.error("엑셀 파일에 1w, 1m, 3m 시트가 모두 있어야 합니다.")
+            else:
+                data_1w = parse_sheet_ticker_value(sheet_map['1w'], allowed_db_tickers, show_debug_log)
+                data_1m = parse_sheet_ticker_value(sheet_map['1m'], allowed_db_tickers, show_debug_log)
+                data_3m = parse_sheet_ticker_value(sheet_map['3m'], allowed_db_tickers, show_debug_log)
+                all_tickers = set(data_1w.keys()) | set(data_1m.keys()) | set(data_3m.keys())
+                
+                if not all_tickers: st.warning("매칭되는 데이터 없음")
+                else:
+                    today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+                    existing_map = {}
+                    try:
+                        res = supabase.table("quant_data").select("*").gte("created_at", f"{today_str} 00:00:00").lte("created_at", f"{today_str} 23:59:59").execute()
+                        if res.data:
+                            for rec in res.data: existing_map[rec['ticker']] = (str(rec.get('change_1w') or "-"), str(rec.get('change_1m') or "-"), str(rec.get('change_3m') or "-"))
+                    except: pass
+                    
+                    rows_to_insert = []
+                    skipped_count = 0
+                    for t in all_tickers:
+                        v_1w, v_1m, v_3m = data_1w.get(t, "-"), data_1m.get(t, "-"), data_3m.get(t, "-")
+                        if t in existing_map and existing_map[t] == (v_1w, v_1m, v_3m):
+                            skipped_count += 1
+                            continue
+                        rows_to_insert.append({"ticker": t, "change_1w": v_1w, "change_1m": v_1m, "change_3m": v_3m})
+                    
+                    if rows_to_insert:
+                        for i in range(0, len(rows_to_insert), 100):
+                            supabase.table("quant_data").insert(rows_to_insert[i:i+100]).execute()
+                        st.success(f"✅ DB 업로드 완료! (신규: {len(rows_to_insert)}건, 중복생략: {skipped_count}건)")
+                        fetch_latest_quant_data_from_db.clear()
+                    else: st.info(f"변동 사항이 없습니다. (중복 생략: {skipped_count}건)")
+        except Exception as e: st.error(f"작업 실패: {e}")
+
+st.markdown("---")
+with st.expander("🗄️ 전체 저장 기록 보기 / 관리"):
+    col_e1, col_e2 = st.columns([1, 1])
+    with col_e1:
+        if st.button("🔄 기록 새로고침"):
+            try:
+                res = supabase.table("history").select("*").order("created_at", desc=True).limit(50).execute()
+                if res.data: st.dataframe(pd.DataFrame(res.data), use_container_width=True)
+            except Exception as e: st.error(str(e))
+    with col_e2:
+        if st.button("🧹 중복 데이터 정리 (최신본만 유지)"):
+            remove_duplicates_from_db()

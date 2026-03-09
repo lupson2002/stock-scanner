@@ -4,17 +4,18 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime, timezone
+from dateutil.relativedelta import relativedelta  # [NEW] 날짜 계산용 추가
 from supabase import create_client, Client
 from scipy.signal import argrelextrema
 import time
+import re
+
+# [NEW] 한국 ETF 및 주식 스크래핑용 추가 라이브러리
+import FinanceDataReader as fdr
+import requests
+from bs4 import BeautifulSoup
 import random
 import concurrent.futures
-import re
-import requests # [핵심] 독립 세션 생성을 위해 필수
-
-# [NEW] 한국 ETF 스크래핑용 추가 라이브러리
-import FinanceDataReader as fdr
-from bs4 import BeautifulSoup
 
 # =========================================================
 # [설정] Supabase 연결 정보 (보안 적용)
@@ -53,7 +54,7 @@ COUNTRY_GID = '1247750129'
 COUNTRY_CSV_URL = f'https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={COUNTRY_GID}'
 
 # ==========================================
-# 3. 공통 함수 정의 & 병렬 처리 헬퍼
+# 3. 공통 함수 정의
 # ==========================================
 
 def get_tickers_from_sheet():
@@ -138,52 +139,45 @@ def remove_duplicates_from_db():
             st.success(f"🧹 History 중복된 {len(ids_to_remove)}개 데이터를 삭제했습니다.")
         else:
             st.info("History: 삭제할 중복 데이터가 없습니다.")
+
     except Exception as e:
         st.error(f"중복 제거 실패: {e}")
 
-# 🔥 [핵심 최적화 1] 독립 세션(Session) 분리 및 yfinance IP 차단 우회
-@st.cache_data(ttl=3600*24, show_spinner=False)
 def smart_download(ticker, interval="1d", period="2y"):
     if ':' in ticker: ticker = ticker.split(':')[-1]
     ticker = ticker.replace('/', '-')
+    
     ticker_yf = ticker.replace(' ', '-')
     
     candidates = [ticker_yf]
     if ticker_yf.isdigit() and len(ticker_yf) == 6:
         candidates = [f"{ticker_yf}.KS", f"{ticker_yf}.KQ", ticker_yf]
-        
-    # [수정] yfinance 전용 세션을 만들어 일반 사용자의 웹 브라우저처럼 위장합니다.
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
-    })
     
     for t in candidates:
-        for attempt in range(3):
-            try:
-                # session 파라미터 전달
-                df = yf.download(t, period=period, interval=interval, progress=False, auto_adjust=False, session=session)
+        try:
+            for _ in range(3):
+                df = yf.download(t, period=period, interval=interval, progress=False, auto_adjust=False)
                 if len(df) > 0:
                     if isinstance(df.columns, pd.MultiIndex):
                         df.columns = df.columns.get_level_values(0)
+                    
                     df = df.loc[:, ~df.columns.duplicated()].copy()
                     return t, df
-            except:
-                pass
-            # 요청 실패 시 대기 시간을 충분히(0.5~1.2초) 주어 서버가 공격으로 인지하지 못하게 방어합니다.
-            time.sleep(random.uniform(0.5, 1.2))
+                time.sleep(0.3)
+        except:
+            continue
     return ticker, pd.DataFrame()
 
-@st.cache_data(ttl=3600*24, show_spinner=False) 
+@st.cache_data(ttl=3600*24) 
 def get_ticker_info_safe(ticker):
     try:
         tick = yf.Ticker(ticker)
-        for attempt in range(3):
+        for _ in range(3):
             try:
                 meta = tick.info
                 if meta: return meta
             except:
-                time.sleep(random.uniform(0.5, 1.2))
+                time.sleep(0.5)
         return None
     except:
         return None
@@ -219,9 +213,9 @@ def save_to_supabase(data_list, strategy_name):
     rows_to_insert = []
     for item in data_list:
         rows_to_insert.append({
-            "ticker": str(item.get('종목코드', item.get('종목', ''))),
+            "ticker": str(item['종목코드']),
             "sector": str(item.get('섹터', '-')),
-            "price": str(item.get('현재가', '0')).replace(',', ''),
+            "price": str(item['현재가']).replace(',', ''),
             "strategy": strategy_name,
             "high_date": str(item.get('현52주신고가일', '')), 
             "bw": str(item.get('BW_Value', '')), 
@@ -281,36 +275,6 @@ def get_eps_changes_from_db(ticker):
         d = GLOBAL_QUANT_DATA[norm_ticker]
         return d['1w'], d['1m'], d['3m']
     return "-", "-", "-"
-
-# ==========================================
-# 🚀 [핵심 최적화 2] 스트림릿 UI 충돌을 방지하는 안전한 병렬 실행기
-# ==========================================
-def run_concurrent_analysis(func, items, max_workers=3):
-    """지정된 함수(func)를 items 리스트에 대해 병렬로 실행합니다. 기본 max_workers=3으로 하향 조정"""
-    results = []
-    if not items: return results
-    
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    total = len(items)
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_item = {executor.submit(func, item): item for item in items}
-        
-        for i, future in enumerate(concurrent.futures.as_completed(future_to_item)):
-            try:
-                res = future.result()
-                if res is not None:
-                    results.append(res)
-            except Exception as e:
-                pass 
-            
-            progress_bar.progress((i + 1) / total)
-            status_text.text(f"🚀 병렬 분석 진행 중... ({i+1}/{total})")
-            
-    progress_bar.empty()
-    status_text.empty()
-    return results
 
 # ==========================================
 # 4. 분석 알고리즘 (지표 계산 & 패턴)
@@ -423,9 +387,9 @@ def check_vcp_pattern(df):
 
     window = 60
     subset = df.iloc[-window:]
-    p1 = subset.iloc[:20]    
-    p2 = subset.iloc[20:40]  
-    p3 = subset.iloc[40:]    
+    p1 = subset.iloc[:20]    # 20일
+    p2 = subset.iloc[20:40]  # 20일
+    p3 = subset.iloc[40:]    # 20일
     
     range1 = (p1['High'].max() - p1['Low'].min()) / p1['High'].max()
     range2 = (p2['High'].max() - p2['Low'].min()) / p2['High'].max()
@@ -659,27 +623,30 @@ def check_monthly_condition(df):
         return True, {'price': curr_price, 'ath_price': ath_price, 'ath_date': ath_idx.strftime('%Y-%m'), 'month_count': month_count}
     return False, None
 
-# [병렬처리 적용] 섹터 및 국가 탭에 대한 전략 분석 로직
 def analyze_momentum_strategy(target_list, type_name="ETF"):
     if not target_list: return pd.DataFrame()
     st.write(f"📊 총 {len(target_list)}개 {type_name} 분석 중...")
-    
-    def process_item(item):
-        t, n = item
+    results = []; pbar = st.progress(0)
+    for i, (t, n) in enumerate(target_list):
+        pbar.progress((i+1)/len(target_list))
         rt, df = smart_download(t, "1d", "2y")
-        if len(df)<50: return None
+        if len(df)<50: continue # BBW를 위해 최소 50일 필요
         
+        # 일봉 지표 전체 계산
         df_indicators = calculate_daily_indicators(df)
-        if df_indicators is None: return None
+        if df_indicators is None: continue
         
         c = df['Close']; curr=c.iloc[-1]
         
+        # BBW(ema 50, 2) 계산
         ema50_bbw = c.ewm(span=50, adjust=False).mean()
         std50_bbw = c.rolling(window=50).std()
         bbw = (4 * std50_bbw) / ema50_bbw
         curr_bbw = bbw.iloc[-1]
         
-        if pd.isna(curr_bbw) or curr_bbw <= 0: curr_bbw = 0.001
+        # 0 나누기 방지
+        if pd.isna(curr_bbw) or curr_bbw <= 0: 
+            curr_bbw = 0.001
 
         squeeze_on = df_indicators['TTM_Squeeze'].iloc[-5:].any() if 'TTM_Squeeze' in df_indicators.columns else False
         ema20=c.ewm(span=20).mean(); ema50=c.ewm(span=50).mean(); ema60=c.ewm(span=60).mean()
@@ -715,10 +682,10 @@ def analyze_momentum_strategy(target_list, type_name="ETF"):
         else:
             high_52_date = "-"; prev_date = "-"; diff_days = 0
             
-        return {
+        results.append({
             f"{type_name}": f"{rt} ({n})", 
-            "순수모멘텀스코어_raw": pure_score, 
-            "최종모멘텀스코어_raw": final_score, 
+            "순수모멘텀스코어_raw": pure_score,   
+            "최종모멘텀스코어_raw": final_score,  
             "스퀴즈": "🔥" if squeeze_on else "-", 
             "BB(50,2)돌파": bb_bk, 
             "돈키언(50)돌파": dc_bk, 
@@ -730,13 +697,12 @@ def analyze_momentum_strategy(target_list, type_name="ETF"):
             "전52주신고가일": prev_date,
             "차이일": f"{diff_days}일",
             "현재가": curr
-        }
+        })
         
-    # [수정] yfinance 통신이 포함되므로 max_workers=3 으로 유지
-    results = run_concurrent_analysis(process_item, target_list, max_workers=3)
-    
+    pbar.empty()
     if results:
         df_res = pd.DataFrame(results)
+        
         df_res = df_res.sort_values("순수모멘텀스코어_raw", ascending=False).reset_index(drop=True)
         total_count = len(df_res)
         
@@ -749,6 +715,7 @@ def analyze_momentum_strategy(target_list, type_name="ETF"):
             return "🚨매수발생" if (is_top_25 and is_breakout) else "-"
         
         df_res['저변동돌파'] = df_res.apply(check_buy_signal, axis=1)
+        
         df_res['순수모멘텀스코어'] = df_res['순수모멘텀스코어_raw'].apply(lambda x: f"{x:.2f}")
         df_res['현재가'] = df_res['현재가'].apply(lambda x: f"{x:,.2f}")
         
@@ -799,10 +766,7 @@ def get_compass_signal():
     ALL_TICKERS = list(set(OFFENSE + [CASH]))
     
     try:
-        # [수정] yfinance 통신 시 단일 다운로드도 약간의 지연 부여
-        session = requests.Session()
-        session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
-        data = yf.download(ALL_TICKERS, period="2y", progress=False, auto_adjust=False, session=session)['Close']
+        data = yf.download(ALL_TICKERS, period="2y", progress=False, auto_adjust=False)['Close']
         if data.empty: return None, "데이터 없음"
     except:
         return None, "다운로드 실패"
@@ -928,7 +892,10 @@ def fetch_korean_etf_data(ticker, name):
             'Symbol': ticker, 'Name': name,
             '1M_Return(%)': ret_1m, '3M_Return(%)': ret_3m,
             '6M_Return(%)': ret_6m, '12M_Return(%)': ret_12m,
-            'BBW': curr_bbw, '스퀴즈': squeeze_val, 'BB(50,2)돌파': bb_bk_val, '돈키언(50)돌파': dc_bk_val
+            'BBW': curr_bbw,
+            '스퀴즈': squeeze_val,          
+            'BB(50,2)돌파': bb_bk_val,   
+            '돈키언(50)돌파': dc_bk_val  
         }
     except Exception as e:
         return {
@@ -945,44 +912,56 @@ def run_korean_etf_analysis():
     tickers = df_etf['Symbol'].tolist()
     names = df_etf['Name'].tolist()
     
+    results = []
     items_to_fetch = list(zip(tickers, names))
     
-    # [수정] 네이버 스크래핑은 yfinance가 아니므로 속도를 위해 max_workers=8 유지
-    results = run_concurrent_analysis(lambda item: fetch_korean_etf_data(item[0], item[1]), items_to_fetch, max_workers=8)
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    total = len(items_to_fetch)
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(fetch_korean_etf_data, ticker, name) for ticker, name in items_to_fetch]
+        
+        for i, future in enumerate(concurrent.futures.as_completed(futures)):
+            results.append(future.result())
+            if i % 10 == 0 or i == total - 1:
+                progress_bar.progress((i + 1) / total)
+                status_text.text(f"🚀 네이버 금융 스크래핑 진행 중... ({i+1}/{total})")
+
+    progress_bar.empty()
+    status_text.empty()
     
     df_returns = pd.DataFrame(results)
     
-    if not df_returns.empty:
-        df_returns['순수모멘텀스코어_raw'] = (
-            0.5 * (df_returns['12M_Return(%)'] + df_returns['6M_Return(%)']) 
-            - df_returns['3M_Return(%)'] 
-            + df_returns['1M_Return(%)']
-        )
-        df_returns['최종모멘텀스코어_raw'] = df_returns['순수모멘텀스코어_raw'] / df_returns['BBW']
-        
-        df_returns = df_returns.dropna(subset=['순수모멘텀스코어_raw']).sort_values(by='순수모멘텀스코어_raw', ascending=False).reset_index(drop=True)
-        
-        total_count = len(df_returns)
-        df_returns['rank_temp'] = df_returns['최종모멘텀스코어_raw'].rank(method='min', ascending=False)
-        df_returns['조정 모멘텀 순위'] = df_returns['rank_temp'].apply(lambda x: f"{int(x)}/{total_count}")
-        
-        def check_buy_signal(row):
-            is_top_25 = row['rank_temp'] <= (total_count * 0.25)
-            is_breakout = (row['BB(50,2)돌파'] == 'O') or (row['돈키언(50)돌파'] == 'O')
-            return "🚨매수발생" if (is_top_25 and is_breakout) else "-"
+    df_returns['순수모멘텀스코어_raw'] = (
+        0.5 * (df_returns['12M_Return(%)'] + df_returns['6M_Return(%)']) 
+        - df_returns['3M_Return(%)'] 
+        + df_returns['1M_Return(%)']
+    )
+    df_returns['최종모멘텀스코어_raw'] = df_returns['순수모멘텀스코어_raw'] / df_returns['BBW']
+    
+    df_returns = df_returns.dropna(subset=['순수모멘텀스코어_raw']).sort_values(by='순수모멘텀스코어_raw', ascending=False).reset_index(drop=True)
+    
+    total_count = len(df_returns)
+    df_returns['rank_temp'] = df_returns['최종모멘텀스코어_raw'].rank(method='min', ascending=False)
+    df_returns['조정 모멘텀 순위'] = df_returns['rank_temp'].apply(lambda x: f"{int(x)}/{total_count}")
+    
+    def check_buy_signal(row):
+        is_top_25 = row['rank_temp'] <= (total_count * 0.25)
+        is_breakout = (row['BB(50,2)돌파'] == 'O') or (row['돈키언(50)돌파'] == 'O')
+        return "🚨매수발생" if (is_top_25 and is_breakout) else "-"
 
-        df_returns['저변동돌파'] = df_returns.apply(check_buy_signal, axis=1)
-        df_returns['순수모멘텀스코어'] = df_returns['순수모멘텀스코어_raw'].apply(lambda x: f"{x:.2f}")
-        
-        cols_order = [
-            'Symbol', 'Name', '순수모멘텀스코어', '조정 모멘텀 순위', 
-            '스퀴즈', 'BB(50,2)돌파', '돈키언(50)돌파', '저변동돌파',
-            '1M_Return(%)', '3M_Return(%)', '6M_Return(%)', '12M_Return(%)'
-        ]
-        
-        final_cols = [c for c in cols_order if c in df_returns.columns]
-        return df_returns[final_cols]
-    return pd.DataFrame()
+    df_returns['저변동돌파'] = df_returns.apply(check_buy_signal, axis=1)
+    df_returns['순수모멘텀스코어'] = df_returns['순수모멘텀스코어_raw'].apply(lambda x: f"{x:.2f}")
+    
+    cols_order = [
+        'Symbol', 'Name', '순수모멘텀스코어', '조정 모멘텀 순위', 
+        '스퀴즈', 'BB(50,2)돌파', '돈키언(50)돌파', '저변동돌파',
+        '1M_Return(%)', '3M_Return(%)', '6M_Return(%)', '12M_Return(%)'
+    ]
+    
+    final_cols = [c for c in cols_order if c in df_returns.columns]
+    return df_returns[final_cols]
 
 def check_dual_ma_breakout(df):
     if len(df) < 250: return False, None
@@ -1044,17 +1023,175 @@ def check_dual_ma_breakout(df):
                 "Yest_Phase": yest_phase,
                 "Price": df.iloc[curr_idx]['Close'],
                 "EMA20": df.iloc[curr_idx]['EMA20'],
-                "Is_New": True 
+                "Is_New": True
             }
 
     return False, None
 
 
 # ==========================================
+# [NEW] 한국 주식 저변동모멘텀 분석 함수 (병렬 처리 적용)
+# ==========================================
+def fetch_korean_stock_data(ticker, name, group, marcap, start_date):
+    try:
+        df = fdr.DataReader(ticker, start_date)
+        if len(df) < 250: return None
+        c = df['Close']
+
+        # BBW 계산
+        ma50 = c.rolling(window=50).mean()
+        std50 = c.rolling(window=50).std()
+        bbw = (4 * std50) / ma50
+
+        # 모멘텀 계산
+        m1 = c / c.shift(20) - 1
+        m3 = c / c.shift(60) - 1
+        m6 = c / c.shift(120) - 1
+        m12 = c / c.shift(250) - 1
+        mom_score = (m12 + m6) * 0.5 - m3 + m1
+
+        latest_bbw = bbw.iloc[-1]
+        latest_mom = mom_score.iloc[-1]
+
+        if pd.isna(latest_bbw) or pd.isna(latest_mom): return None
+
+        return {
+            '종목코드': ticker,
+            '종목명': name,
+            '그룹': group,
+            '시가총액': marcap,
+            'BBW': round(latest_bbw, 4),
+            '모멘텀': round(latest_mom, 4)
+        }
+    except:
+        return None
+
+def run_korean_stock_low_vol_momentum():
+    today = datetime.today()
+    start_date = (today - relativedelta(months=16)).strftime("%Y%m%d")
+
+    # 1. 시가총액 데이터 수집
+    st.info("🌐 네이버 증권에서 시가총액 및 종목 정보를 수집합니다... (약 10~20초 소요)")
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    market_cap_data = []
+
+    progress_scrape = st.progress(0)
+    for sosok in [0, 1]:  # 0: 코스피, 1: 코스닥
+        for page in range(1, 46):
+            # 프로그레스 바 업데이트
+            progress_ratio = ((sosok * 45) + page) / 90
+            progress_scrape.progress(min(progress_ratio, 1.0))
+            
+            url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page={page}"
+            try:
+                res = requests.get(url, headers=headers, timeout=5)
+                soup = BeautifulSoup(res.text, 'html.parser')
+                table = soup.find('table', {'class': 'type_2'})
+                if not table: break
+
+                rows = table.find_all('tr')
+                added = False
+                for row in rows:
+                    cols = row.find_all('td')
+                    if len(cols) >= 7 and cols[1].find('a'):
+                        try:
+                            ticker = cols[1].find('a')['href'].split('code=')[-1]
+                            name = cols[1].text.strip()
+                            marcap_str = cols[6].text.replace(',', '').strip()
+                            if not marcap_str: continue
+                            marcap = int(marcap_str) * 100000000
+                            market_cap_data.append({'Ticker': ticker, '종목명': name, '시가총액': marcap})
+                            added = True
+                        except: continue
+                if not added: break
+            except: pass
+
+    progress_scrape.empty()
+    if not market_cap_data:
+        st.error("데이터 수집에 실패했습니다. 네이버 금융 연결 상태를 확인해주세요.")
+        return pd.DataFrame(), pd.DataFrame()
+
+    df_market = pd.DataFrame(market_cap_data).set_index('Ticker')
+
+    def assign_group(marcap):
+        if marcap >= 1500000000000: return '대형'
+        elif marcap >= 600000000000: return '중형'
+        elif marcap >= 400000000000: return '하단'
+        else: return None
+
+    df_market['그룹'] = df_market['시가총액'].apply(assign_group)
+    target_df = df_market[df_market['그룹'].notna()].copy()
+    
+    st.success(f"✅ 분석 대상: 총 {len(target_df)}개 종목 필터링 완료 (대형/중형/하단)")
+    st.info("🚀 종목별 과거 주가 수집 및 BBW/모멘텀을 계산합니다... (병렬 처리 중)")
+
+    # 2. 병렬로 주가 수집 및 지표 계산
+    tickers = target_df.index
+    results = []
+    
+    items_to_fetch = [(t, target_df.loc[t, '종목명'], target_df.loc[t, '그룹'], target_df.loc[t, '시가총액']) for t in tickers]
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    total = len(items_to_fetch)
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(fetch_korean_stock_data, t, n, g, m, start_date) for t, n, g, m in items_to_fetch]
+        for i, future in enumerate(concurrent.futures.as_completed(futures)):
+            res = future.result()
+            if res: results.append(res)
+            
+            if i % 10 == 0 or i == total - 1:
+                progress_bar.progress((i + 1) / total)
+                status_text.text(f"데이터 계산 중... ({i+1}/{total})")
+
+    progress_bar.empty()
+    status_text.empty()
+
+    if not results:
+        return pd.DataFrame(), pd.DataFrame()
+
+    final_df = pd.DataFrame(results)
+
+    # 3. 그룹별 모멘텀 컷오프 계산 및 판별
+    mom_thresholds = final_df.groupby('그룹')['모멘텀'].quantile(0.80).to_dict()
+
+    def determine_action(row):
+        group = row['그룹']
+        bbw = row['BBW']
+        mom = row['모멘텀']
+        q5_threshold = mom_thresholds.get(group, 0)
+
+        is_q5_momentum = (mom > 0) and (mom >= q5_threshold)
+
+        if is_q5_momentum:
+            if group == '대형' and (0.25 <= bbw <= 0.30): return "🎯 신규 매수 (확장 초입)"
+            elif group == '중형' and (0.10 <= bbw <= 0.15): return "🎯 신규 매수 (정석 눌림목)"
+            elif group == '하단' and (bbw < 0.10): return "🎯 신규 매수 (극도 수축/선취매)"
+
+        if group == '대형' and bbw >= 1.0: return "🔥 강력 홀딩 (추세 이탈 전까지 버티기)"
+        elif group == '중형' and bbw >= 0.8: return "🚨 분할 매도 (단기 과열 진입)"
+        elif group == '하단' and bbw >= 0.6: return "🚨 전량 매도 (슈팅 탈출 구간)"
+
+        return "관망"
+
+    final_df['상태'] = final_df.apply(determine_action, axis=1)
+    final_df = final_df.sort_values(by=['그룹', '시가총액'], ascending=[True, False])
+
+    buy_signals = final_df[final_df['상태'].str.contains('매수')]
+    sell_signals = final_df[final_df['상태'].str.contains('매도|홀딩')]
+
+    return buy_signals, sell_signals
+
+
+# ==========================================
 # 5. 메인 실행 화면
 # ==========================================
 
-tab_compass, tab1, tab2, tab3, tab4, tab5 = st.tabs(["🧭 나침판", "🌍 섹터", "🏳️ 국가", "📊 기술적 분석", "💰 재무분석", "📂 엑셀 데이터 매칭"])
+# [NEW] 탭 순서 변경 및 한국주식분석 탭 추가 (기술적 분석 옆)
+tab_compass, tab1, tab2, tab3, tab_korea, tab4, tab5 = st.tabs([
+    "🧭 나침판", "🌍 섹터", "🏳️ 국가", "📊 기술적 분석", "🇰🇷 한국주식분석", "💰 재무분석", "📂 엑셀 데이터 매칭"
+])
 
 with tab_compass:
     st.markdown("### 🧭 투자 나침판 (Smoothed Momentum Strategy)")
@@ -1099,7 +1236,7 @@ with tab_compass:
                 st.error(f"분석 실패: {position}")
 
 # -----------------------------------------------------------------------------
-# [탭 2] 섹터
+# [탭 1] 섹터
 # -----------------------------------------------------------------------------
 with tab1:
     cols = st.columns(12) 
@@ -1154,53 +1291,65 @@ with tab3:
         else:
             st.info(f"구글 시트에서 총 **{len(tickers)}**개 종목을 불러왔습니다. (4단계 돌파 종목만 스크리닝 중...)")
             
-            def process_vcp(t):
+            status_text = st.empty()
+            bar = st.progress(0)
+            
+            res = []
+            chart_data_cache = {}
+            count_total = len(tickers)
+            
+            for i, t in enumerate(tickers):
+                status_text.text(f"⏳ 진행 중... ({i+1}/{count_total}) - {t}")
+                bar.progress((i+1)/len(tickers))
                 t_clean = t.strip()
+                
                 try:
                     final_ticker, df = smart_download(t_clean, "1d", "2y")
-                except: return None
-                if len(df) < 250: return None
+                except:
+                    continue
+
+                if len(df) < 250: continue
 
                 passed, info = check_vcp_pattern(df)
+                
                 if passed and "4단계" in info['status']:
-                    df_prev = df.iloc[:-1].copy()
+                    df_prev = df.iloc[:-1].copy() 
                     y_passed, y_info = check_vcp_pattern(df_prev)
                     prev_status = y_info['status'] if y_passed else "-"
 
                     eps1w, eps1m, eps3m = get_eps_changes_from_db(final_ticker)
                     weekly_macd_status = get_weekly_macd_status(df)
                     sector = get_stock_sector(final_ticker)
+                    chart_data_cache[final_ticker] = {'df': df, 'info': info}
                     
-                    res_dict = {
-                        '종목코드': final_ticker, '섹터': sector, '현재가': f"{info['price']:,.0f}",
-                        '비고': info['status'], '전일비고': prev_status,
-                        '주봉MACD': weekly_macd_status, '손절가': f"{info['stop_loss']:,.0f}",
-                        '목표가(3R)': f"{info['target_price']:,.0f}", '스퀴즈': info['squeeze'],
+                    res.append({
+                        '종목코드': final_ticker, 
+                        '섹터': sector, 
+                        '현재가': f"{info['price']:,.0f}",
+                        '비고': info['status'],      
+                        '전일비고': prev_status,      
+                        '주봉MACD': weekly_macd_status, 
+                        '손절가': f"{info['stop_loss']:,.0f}", 
+                        '목표가(3R)': f"{info['target_price']:,.0f}",
+                        '스퀴즈': info['squeeze'],
                         '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
                         'Pivot': f"{info['pivot']:,.0f}" 
-                    }
-                    chart_dict = {final_ticker: {'df': df, 'info': info}}
-                    return res_dict, chart_dict
-                return None
-
-            # [수정] yfinance 통신이므로 max_workers=3 적용
-            results = run_concurrent_analysis(process_vcp, tickers, max_workers=3)
-            res = []
-            chart_data_cache = {}
-            for r in results:
-                res.append(r[0])
-                chart_data_cache.update(r[1])
+                    })
+            bar.empty()
+            status_text.empty() 
             
-            st.success(f"✅ 분석 완료! 돌파(4단계) 종목을 찾았습니다.")
+            st.success(f"✅ 분석 완료! 총 {count_total}개 종목 중 돌파(4단계) 종목을 찾았습니다.")
             
             if res:
                 df_res = pd.DataFrame(res)
+                
                 cols_order = [
                     '종목코드', '섹터', '현재가', '비고', '전일비고', 
                     '주봉MACD', '손절가', '목표가(3R)', '스퀴즈', 
                     '1W변화', '1M변화', '3M변화', 'Pivot'
                 ]
                 final_cols = [c for c in cols_order if c in df_res.columns]
+                
                 st.dataframe(df_res[final_cols], use_container_width=True)
                 
                 if res:
@@ -1233,25 +1382,23 @@ with tab3:
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info(f"[일봉 5-Factor] {len(tickers)}개 분석 시작...")
-            
-            def process_daily(t):
+            bar = st.progress(0); res = []
+            for i, t in enumerate(tickers):
+                bar.progress((i+1)/len(tickers))
                 rt, df = smart_download(t, "1d", "2y")
                 passed, info = check_daily_condition(df)
                 if passed:
                     eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
                     sector = get_stock_sector(rt)
-                    return {
+                    res.append({
                         '종목코드': rt, '섹터': sector, '현재가': f"{info['price']:,.0f}",
                         'ATR(14)': f"{info['atr']:,.0f}", '스퀴즈': info['squeeze'],
                         '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
                         '현52주신고가일': info['high_date'], '전52주신고가일': info['prev_date'],
                         '차이일': f"{info['diff_days']}일", 'BW현재': f"{info['bw_curr']:.4f}",
                         'MACD-V': f"{info['macdv']:.2f}", 'BW_Value': f"{info['bw_curr']:.4f}", 'MACD_V_Value': f"{info['macdv']:.2f}"
-                    }
-                return None
-                
-            # [수정] yfinance 통신이므로 max_workers=3 적용
-            res = run_concurrent_analysis(process_daily, tickers, max_workers=3)
+                    })
+            bar.empty()
             if res:
                 st.success(f"[일봉] {len(res)}개 발견!")
                 st.dataframe(pd.DataFrame(res).drop(columns=['BW_Value', 'MACD_V_Value']))
@@ -1262,22 +1409,21 @@ with tab3:
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info(f"[주봉] {len(tickers)}개 분석 시작...")
-            
-            def process_weekly(t):
+            bar = st.progress(0); res = []
+            for i, t in enumerate(tickers):
+                bar.progress((i+1)/len(tickers))
                 rt, df = smart_download(t, "1wk", "2y")
                 passed, info = check_weekly_condition(df)
                 if passed:
                     eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
                     sector = get_stock_sector(rt)
-                    return {
+                    res.append({
                         '종목코드': rt, '섹터': sector, '현재가': f"{info['price']:,.0f}",
                         'ATR(14주)': f"{info['atr']:,.0f}", '구분': info['bw_change'], 
                         '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
                         'MACD-V': f"{info['macdv']:.2f}", 'BW_Value': f"{info['bw_curr']:.4f}", 'MACD_V_Value': f"{info['macdv']:.2f}"
-                    }
-                return None
-            
-            res = run_concurrent_analysis(process_weekly, tickers, max_workers=3)
+                    })
+            bar.empty()
             if res:
                 st.success(f"[주봉] {len(res)}개 발견!")
                 st.dataframe(pd.DataFrame(res).drop(columns=['BW_Value', 'MACD_V_Value']))
@@ -1288,23 +1434,22 @@ with tab3:
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info(f"[월봉] {len(tickers)}개 분석 시작...")
-            
-            def process_monthly(t):
+            bar = st.progress(0); res = []
+            for i, t in enumerate(tickers):
+                bar.progress((i+1)/len(tickers))
                 rt, df = smart_download(t, "1mo", "max")
                 passed, info = check_monthly_condition(df)
                 if passed:
                     eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
                     sector = get_stock_sector(rt)
-                    return {
+                    res.append({
                         '종목코드': rt, '섹터': sector, '현재가': f"{info['price']:,.0f}",
                         'ATH최고가': f"{info['ath_price']:,.0f}", 'ATH달성월': info['ath_date'],
                         '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
                         '고권역(월수)': f"{info['month_count']}개월",
                         '현52주신고가일': info['ath_date'], 'BW_Value': str(info['month_count']), 'MACD_V_Value': "0"
-                    }
-                return None
-                
-            res = run_concurrent_analysis(process_monthly, tickers, max_workers=3)
+                    })
+            bar.empty()
             if res:
                 st.success(f"[월봉] {len(res)}개 발견!")
                 st.dataframe(pd.DataFrame(res).drop(columns=['현52주신고가일', 'BW_Value', 'MACD_V_Value'], errors='ignore'))
@@ -1315,27 +1460,26 @@ with tab3:
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info("일봉+월봉 분석 중...")
-            
-            def process_daily_monthly(t):
+            bar = st.progress(0); res = []
+            for i, t in enumerate(tickers):
+                bar.progress((i+1)/len(tickers))
                 rt, df_d = smart_download(t, "1d", "2y")
                 pass_d, info_d = check_daily_condition(df_d)
-                if not pass_d: return None
+                if not pass_d: continue
                 _, df_m = smart_download(t, "1mo", "max")
                 pass_m, info_m = check_monthly_condition(df_m)
-                if not pass_m: return None
-                
+                if not pass_m: continue
                 sector = get_stock_sector(rt)
                 eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
-                return {
+                res.append({
                     '종목코드': rt, '섹터': sector, '현재가': f"{info_d['price']:,.0f}",
                     '스퀴즈': info_d['squeeze'], 'ATH달성월': info_m['ath_date'],
                     '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
                     '고권역(월수)': f"{info_m['month_count']}개월",
                     '현52주신고가일': info_d['high_date'], '전52주신고가일': info_d['prev_date'],
                     '차이일': f"{info_d['diff_days']}일", 'BW_Value': str(info_m['month_count']), 'MACD_V_Value': f"{info_d['macdv']:.2f}"
-                }
-                
-            res = run_concurrent_analysis(process_daily_monthly, tickers, max_workers=3)
+                })
+            bar.empty()
             if res:
                 st.success(f"[일+월봉] {len(res)}개 발견!")
                 st.dataframe(pd.DataFrame(res))
@@ -1346,26 +1490,25 @@ with tab3:
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info("일봉+주봉 분석 중...")
-            
-            def process_daily_weekly(t):
+            bar = st.progress(0); res = []
+            for i, t in enumerate(tickers):
+                bar.progress((i+1)/len(tickers))
                 rt, df_d = smart_download(t, "1d", "2y")
                 pass_d, info_d = check_daily_condition(df_d)
-                if not pass_d: return None
+                if not pass_d: continue
                 _, df_w = smart_download(t, "1wk", "2y")
                 pass_w, info_w = check_weekly_condition(df_w)
-                if not pass_w: return None
-                
+                if not pass_w: continue
                 sector = get_stock_sector(rt)
                 eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
-                return {
+                res.append({
                     '종목코드': rt, '섹터': sector, '현재가': f"{info_d['price']:,.0f}",
                     '스퀴즈': info_d['squeeze'], '주봉BW': f"{info_w['bw_curr']:.4f}", '주봉구분': info_w['bw_change'],
                     '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
                     '현52주신고가일': info_d['high_date'], '전52주신고가일': info_d['prev_date'],
                     '차이일': f"{info_d['diff_days']}일", 'BW_Value': f"{info_w['bw_curr']:.4f}", 'MACD_V_Value': f"{info_d['macdv']:.2f}"
-                }
-                
-            res = run_concurrent_analysis(process_daily_weekly, tickers, max_workers=3)
+                })
+            bar.empty()
             if res:
                 st.success(f"[일+주봉] {len(res)}개 발견!")
                 st.dataframe(pd.DataFrame(res))
@@ -1376,26 +1519,25 @@ with tab3:
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info("주봉+월봉 분석 중...")
-            
-            def process_weekly_monthly(t):
+            bar = st.progress(0); res = []
+            for i, t in enumerate(tickers):
+                bar.progress((i+1)/len(tickers))
                 rt, df_w = smart_download(t, "1wk", "2y")
                 pass_w, info_w = check_weekly_condition(df_w)
-                if not pass_w: return None
+                if not pass_w: continue
                 _, df_m = smart_download(t, "1mo", "max")
                 pass_m, info_m = check_monthly_condition(df_m)
-                if not pass_m: return None
-                
+                if not pass_m: continue
                 sector = get_stock_sector(rt)
                 eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
-                return {
+                res.append({
                     '종목코드': rt, '섹터': sector, '현재가': f"{info_w['price']:,.0f}",
                     '주봉BW': f"{info_w['bw_curr']:.4f}", '주봉구분': info_w['bw_change'],
                     '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
                     'ATH달성월': info_m['ath_date'], '고권역(월수)': f"{info_m['month_count']}개월",
                     '현52주신고가일': info_m['ath_date'], 'BW_Value': f"{info_w['bw_curr']:.4f}", 'MACD_V_Value': f"{info_w['macdv']:.2f}"
-                }
-                
-            res = run_concurrent_analysis(process_weekly_monthly, tickers, max_workers=3)
+                })
+            bar.empty()
             if res:
                 st.success(f"[주+월봉] {len(res)}개 발견!")
                 st.dataframe(pd.DataFrame(res))
@@ -1406,21 +1548,21 @@ with tab3:
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info("통합(일+주+월) 분석 중...")
-            
-            def process_integrated(t):
+            bar = st.progress(0); res = []
+            for i, t in enumerate(tickers):
+                bar.progress((i+1)/len(tickers))
                 rt, df_d = smart_download(t, "1d", "2y")
                 pass_d, info_d = check_daily_condition(df_d)
-                if not pass_d: return None
+                if not pass_d: continue
                 _, df_w = smart_download(t, "1wk", "2y")
                 pass_w, info_w = check_weekly_condition(df_w)
-                if not pass_w: return None
+                if not pass_w: continue
                 _, df_m = smart_download(t, "1mo", "max")
                 pass_m, info_m = check_monthly_condition(df_m)
-                if not pass_m: return None
-                
+                if not pass_m: continue
                 sector = get_stock_sector(rt)
                 eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
-                return {
+                res.append({
                     '종목코드': rt, '섹터': sector, '현재가': f"{info_d['price']:,.0f}",
                     'ATH최고가': f"{info_m['ath_price']:,.0f}", 'ATH달성월': info_m['ath_date'],
                     '해당월수': f"{info_m['month_count']}개월", '스퀴즈': info_d['squeeze'],
@@ -1429,9 +1571,8 @@ with tab3:
                     '차이일': f"{info_d['diff_days']}일", '주봉BW': f"{info_w['bw_curr']:.4f}",
                     '주봉구분': info_w['bw_change'], 'MACD-V': f"{info_w['macdv']:.2f}",
                     'BW_Value': f"{info_w['bw_curr']:.4f}", 'MACD_V_Value': f"{info_w['macdv']:.2f}"
-                }
-                
-            res = run_concurrent_analysis(process_integrated, tickers, max_workers=3)
+                })
+            bar.empty()
             if res:
                 st.success(f"⚡ 통합 분석 완료! {len(res)}개 발견")
                 st.dataframe(pd.DataFrame(res).drop(columns=['BW_Value', 'MACD_V_Value']))
@@ -1442,14 +1583,15 @@ with tab3:
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info("🎯 [듀얼MA 돌파] 전일 0단계->당일 1단계, 전일 2단계->당일 3단계 전환 스크리닝 중...")
-            
-            def process_dual_ma(t):
+            bar = st.progress(0); res = []
+            for i, t in enumerate(tickers):
+                bar.progress((i+1)/len(tickers))
                 rt, df = smart_download(t, "1d", "2y")
                 pass_dual, info = check_dual_ma_breakout(df)
                 if pass_dual:
                     sector = get_stock_sector(rt)
                     eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
-                    return {
+                    res.append({
                         '상태': "🚨당일신규돌파", 
                         '종목코드': rt, '섹터': sector, '현재가': f"{info['Price']:,.0f}",
                         '전일Phase': info['Yest_Phase'], '당일Phase': info['Today_Phase'], 
@@ -1457,10 +1599,8 @@ with tab3:
                         '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
                         'Is_New': info['Is_New'], 
                         'BW_Value': "0", 'MACD_V_Value': "0" 
-                    }
-                return None
-                
-            res = run_concurrent_analysis(process_dual_ma, tickers, max_workers=3)
+                    })
+            bar.empty()
             if res:
                 df_res = pd.DataFrame(res)
                 df_res = df_res.sort_values(by=['당일Phase'], ascending=[True])
@@ -1469,6 +1609,7 @@ with tab3:
                 
                 st.success(f"🔥 [듀얼MA 돌파] 총 {len(res)}개 발견! (0->1단계, 2->3단계 전환 종목)")
                 st.dataframe(df_display, use_container_width=True)
+                
                 save_to_supabase(res, "Dual_MA_Breakout")
             else: st.warning("지정된 돌파 조건(0->1단계 또는 2->3단계)을 만족하는 신규 돌파 종목이 없습니다.")
 
@@ -1476,25 +1617,24 @@ with tab3:
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info("[컵핸들] 분석 중...")
-            
-            def process_cup_handle(t):
+            bar = st.progress(0); res = []
+            for i, t in enumerate(tickers):
+                bar.progress((i+1)/len(tickers))
                 rt, df = smart_download(t, "1wk", "2y")
                 pass_c, info = check_cup_handle_pattern(df)
                 if pass_c:
                     df = calculate_common_indicators(df, True)
-                    if df is None: return None 
+                    if df is None: continue 
                     curr = df.iloc[-1]
                     sector = get_stock_sector(rt)
                     eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
-                    return {
+                    res.append({
                         '종목코드': rt, '섹터': sector, '현재가': f"{curr['Close']:,.0f}",
                         '패턴상세': f"깊이:{info['depth']}", '돌파가격': info['pivot'],
                         '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
                         'BW_Value': f"{curr['BandWidth']:.4f}", 'MACD_V_Value': f"{curr['MACD_V']:.2f}"
-                    }
-                return None
-                
-            res = run_concurrent_analysis(process_cup_handle, tickers, max_workers=3)
+                    })
+            bar.empty()
             if res:
                 st.success(f"[컵핸들] {len(res)}개 발견!")
                 st.dataframe(pd.DataFrame(res))
@@ -1505,25 +1645,24 @@ with tab3:
         tickers = get_tickers_from_sheet()
         if tickers:
             st.info("[역H&S] 분석 중...")
-            
-            def process_inverse_hs(t):
+            bar = st.progress(0); res = []
+            for i, t in enumerate(tickers):
+                bar.progress((i+1)/len(tickers))
                 rt, df = smart_download(t, "1wk", "2y")
                 pass_h, info = check_inverse_hs_pattern(df)
                 if pass_h:
                     df = calculate_common_indicators(df, True)
-                    if df is None: return None 
+                    if df is None: continue 
                     curr = df.iloc[-1]
                     sector = get_stock_sector(rt)
                     eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
-                    return {
+                    res.append({
                         '종목코드': rt, '섹터': sector, '현재가': f"{curr['Close']:,.0f}",
                         '넥라인': info['Neckline'], '거래량급증': info['Vol_Ratio'],
                         '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
                         'BW_Value': f"{curr['BandWidth']:.4f}", 'MACD_V_Value': f"{curr['MACD_V']:.2f}"
-                    }
-                return None
-                
-            res = run_concurrent_analysis(process_inverse_hs, tickers, max_workers=3)
+                    })
+            bar.empty()
             if res:
                 st.success(f"[역H&S] {len(res)}개 발견!")
                 st.dataframe(pd.DataFrame(res))
@@ -1536,47 +1675,74 @@ with tab3:
         if not db_tickers: st.warning("DB 데이터 없음")
         else:
             st.info(f"{len(db_tickers)}개 종목 재분석 중...")
-            
-            def process_history(t):
+            bar = st.progress(0); res = []
+            for i, t in enumerate(db_tickers):
+                bar.progress((i+1)/len(db_tickers))
                 rt, df = smart_download(t, "1d", "2y")
                 try:
                     df = calculate_common_indicators(df, False)
-                    if df is None: return None
+                    if df is None: continue
                     curr = df.iloc[-1]
                     cond = ""
                     if curr['MACD_V'] > 60: cond = "🔥 공격적 추세"
                     ema20 = df['Close'].ewm(span=20).mean().iloc[-1]
                     if (curr['Close'] > ema20) and ((curr['Close']-ema20)/ema20 < 0.03): cond = "📉 20일선 눌림목"
                     if (curr['Close'] > curr['EMA200']) and (-100 <= curr['MACD_V'] <= -50): cond = "🧲 MACD-V 과매도"
-                    
                     if cond:
                         eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
-                        return {
+                        res.append({
                             '종목코드': rt, '패턴': cond, '현재가': f"{curr['Close']:,.0f}",
                             '1W변화': eps1w, '1M변화': eps1m, '3M변화': eps3m,
                             'MACD-V': f"{curr['MACD_V']:.2f}", 'EMA20': f"{ema20:,.0f}"
-                        }
-                except: return None
-                
-            res = run_concurrent_analysis(process_history, db_tickers, max_workers=3)
+                        })
+                except: continue
+            bar.empty()
             if res:
                 st.success(f"{len(res)}개 발견!")
                 st.dataframe(pd.DataFrame(res), use_container_width=True)
             else: st.warning("조건 만족 없음")
 
+# -----------------------------------------------------------------------------
+# [NEW] 탭 4: 한국주식분석 (저변동모멘텀)
+# -----------------------------------------------------------------------------
+with tab_korea:
+    st.markdown("### 🇰🇷 한국 주식 퀀트 스크리닝")
+    st.info("한국 주식 시장(KOSPI, KOSDAQ)의 시가총액을 그룹화하고, 모멘텀 상위 20% 종목 중 BBW를 만족하는 최적 타점 종목을 발굴합니다.")
+    
+    if st.button("📉 저변동모멘텀 분석 실행 (KOSPI/KOSDAQ 전체)"):
+        with st.spinner("한국 주식 데이터 수집 및 분석을 시작합니다. 잠시만 기다려주세요..."):
+            buy_df, sell_df = run_korean_stock_low_vol_momentum()
+
+            st.markdown("---")
+            st.markdown("#### 🟢 [매수 추천 종목] - 그룹별 모멘텀 상위 20% & 최적 BBW 도달")
+            if not buy_df.empty:
+                st.dataframe(buy_df, use_container_width=True)
+            else:
+                st.warning("⚠️ 오늘은 매수 조건(모멘텀 Q5 + 최적 BBW)을 만족하는 종목이 없습니다. (억지로 매매하지 않고 쉬는 것도 훌륭한 전략입니다!)")
+
+            st.markdown("#### 🔴 [보유 종목 익절/매도 경고 리스트] - 단기 과열 임계치 도달")
+            if not sell_df.empty:
+                st.dataframe(sell_df, use_container_width=True)
+            else:
+                st.info("🚨 현재 과열 경고 구간에 진입한 종목이 없습니다.")
+
+# -----------------------------------------------------------------------------
+# [탭 5, 6] 재무분석 및 엑셀 데이터 연동
+# -----------------------------------------------------------------------------
 with tab4:
     st.markdown("### 💰 재무 지표 분석 & EPS Trend (yfinance)")
     if st.button("📊 재무 지표 가져오기"):
         tickers = get_tickers_from_sheet()
         if not tickers: st.error("티커 없음")
         else:
-            def process_financial(t):
+            bar = st.progress(0); f_res = []
+            for i, t in enumerate(tickers):
+                bar.progress((i + 1) / len(tickers))
                 real_ticker, _ = smart_download(t, "1d", "5d") 
                 try:
                     tick = yf.Ticker(real_ticker)
-                    info = get_ticker_info_safe(real_ticker)
-                    if not info: return None
-                    
+                    info = tick.info
+                    if not info: continue
                     mkt_cap = info.get('marketCap', 0)
                     mkt_cap_str = f"{mkt_cap/1000000000000:.1f}조" if mkt_cap > 1000000000000 else f"{mkt_cap/100000000:.0f}억" if mkt_cap else "-"
                     rev_growth = info.get('revenueGrowth', 0)
@@ -1585,7 +1751,6 @@ with tab4:
                     eps_growth_str = f"{eps_growth*100:.1f}%" if eps_growth else "-"
                     fwd_eps = info.get('forwardEps', '-')
                     peg = info.get('pegRatio', '-')
-                    
                     try:
                         trend_data = tick.eps_trend
                         if trend_data:
@@ -1598,25 +1763,20 @@ with tab4:
                             eps_trend_str = f"30일{trend_30} | 90일{trend_90}"
                         else: eps_trend_str = "-"
                     except: eps_trend_str = "-"
-                    
                     rec = info.get('recommendationKey', '-').upper().replace('_', ' ')
                     target = info.get('targetMeanPrice')
                     curr_p = info.get('currentPrice', 0)
                     upside = f"{(target - curr_p) / curr_p * 100:.1f}%" if (target and curr_p) else "-"
                     eps1w, eps1m, eps3m = get_eps_changes_from_db(real_ticker)
-                    
-                    return {
+                    f_res.append({
                         "종목": real_ticker, "섹터": info.get('sector', '-'), "산업": info.get('industry', '-'),
                         "시가총액": mkt_cap_str, "매출성장(YoY)": rev_str, "EPS성장(YoY)": eps_growth_str,
                         "선행EPS": fwd_eps, "PEG": peg, "EPS추세(올해)": eps_trend_str,
                         "1W변화": eps1w, "1M변화": eps1m, "3M변화": eps3m,
                         "투자의견": rec, "상승여력": upside
-                    }
-                except Exception as e: return None
-
-            st.info("재무제표 데이터 통신을 병렬로 처리합니다. (잠시만 기다려주세요)")
-            f_res = run_concurrent_analysis(process_financial, tickers, max_workers=3)
-            
+                    })
+                except Exception as e: continue
+            bar.empty()
             if f_res:
                 df_fin = pd.DataFrame(f_res)
                 st.success(f"✅ 총 {len(df_fin)}개 기업 재무/EPS 분석 완료")

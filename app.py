@@ -4,12 +4,13 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime, timezone
+from dateutil.relativedelta import relativedelta  # [NEW] 날짜 계산용 추가
 from supabase import create_client, Client
 from scipy.signal import argrelextrema
 import time
 import re
 
-# [NEW] 한국 ETF 스크래핑용 추가 라이브러리
+# [NEW] 한국 ETF 및 주식 스크래핑용 추가 라이브러리
 import FinanceDataReader as fdr
 import requests
 from bs4 import BeautifulSoup
@@ -146,7 +147,6 @@ def smart_download(ticker, interval="1d", period="2y"):
     if ':' in ticker: ticker = ticker.split(':')[-1]
     ticker = ticker.replace('/', '-')
     
-    # [수정] yfinance에서 오류를 방지하기 위해 공백을 하이픈으로 변경 (예: BRK B -> BRK-B)
     ticker_yf = ticker.replace(' ', '-')
     
     candidates = [ticker_yf]
@@ -161,7 +161,6 @@ def smart_download(ticker, interval="1d", period="2y"):
                     if isinstance(df.columns, pd.MultiIndex):
                         df.columns = df.columns.get_level_values(0)
                     
-                    # [수정 핵심] 중복된 컬럼이 생성되었을 경우 첫 번째 컬럼만 남기고 모두 제거하여 에러 방지
                     df = df.loc[:, ~df.columns.duplicated()].copy()
                     return t, df
                 time.sleep(0.3)
@@ -531,7 +530,6 @@ def check_daily_condition(df):
 def check_weekly_condition(df):
     if len(df) < 40: return False, None
     
-    # [수정] 원본 데이터 손상을 막기 위해 사본을 명시적으로 생성합니다.
     df = df.copy()
     
     df['SMA30'] = df['Close'].rolling(window=30).mean()
@@ -625,7 +623,6 @@ def check_monthly_condition(df):
         return True, {'price': curr_price, 'ath_price': ath_price, 'ath_date': ath_idx.strftime('%Y-%m'), 'month_count': month_count}
     return False, None
 
-# [UPDATE] 섹터 및 국가 탭에 대한 전략 분석 로직 수정
 def analyze_momentum_strategy(target_list, type_name="ETF"):
     if not target_list: return pd.DataFrame()
     st.write(f"📊 총 {len(target_list)}개 {type_name} 분석 중...")
@@ -668,9 +665,7 @@ def analyze_momentum_strategy(target_list, type_name="ETF"):
         r1  = c.pct_change(21).iloc[-1]  if len(c) > 21 else 0
         
         avg_long_term = (r12 + r6) / 2
-        # 순수 모멘텀 스코어 
         pure_score = ((avg_long_term - r3) + r1) * 100
-        # 최종 모멘텀 스코어 (변동성 스케일링)
         final_score = pure_score / curr_bbw
         
         if len(df) >= 252:
@@ -689,8 +684,8 @@ def analyze_momentum_strategy(target_list, type_name="ETF"):
             
         results.append({
             f"{type_name}": f"{rt} ({n})", 
-            "순수모멘텀스코어_raw": pure_score,   # 계산용 (나중에 포맷 변경)
-            "최종모멘텀스코어_raw": final_score,  # 계산용 (순위 산출)
+            "순수모멘텀스코어_raw": pure_score,   
+            "최종모멘텀스코어_raw": final_score,  
             "스퀴즈": "🔥" if squeeze_on else "-", 
             "BB(50,2)돌파": bb_bk, 
             "돈키언(50)돌파": dc_bk, 
@@ -708,15 +703,12 @@ def analyze_momentum_strategy(target_list, type_name="ETF"):
     if results:
         df_res = pd.DataFrame(results)
         
-        # [UPDATE] 1) 순수모멘텀스코어를 기준으로 최대값부터 내림차순 정렬
         df_res = df_res.sort_values("순수모멘텀스코어_raw", ascending=False).reset_index(drop=True)
         total_count = len(df_res)
         
-        # [UPDATE] 2) 조정 모멘텀 순위 생성 (변동성 스케일링 된 최종 점수 기반으로 랭킹 산출)
         df_res['rank_temp'] = df_res['최종모멘텀스코어_raw'].rank(method='min', ascending=False)
         df_res['조정 모멘텀 순위'] = df_res['rank_temp'].apply(lambda x: f"{int(x)}/{total_count}")
         
-        # [UPDATE] 4) 저변동돌파(매수발생) 로직: 상위 25% 이내 & (BB돌파 or 돈키언돌파)
         def check_buy_signal(row):
             is_top_25 = row['rank_temp'] <= (total_count * 0.25)
             is_breakout = (row['BB(50,2)돌파'] == 'O') or (row['돈키언(50)돌파'] == 'O')
@@ -724,11 +716,9 @@ def analyze_momentum_strategy(target_list, type_name="ETF"):
         
         df_res['저변동돌파'] = df_res.apply(check_buy_signal, axis=1)
         
-        # 포맷팅 정리
         df_res['순수모멘텀스코어'] = df_res['순수모멘텀스코어_raw'].apply(lambda x: f"{x:.2f}")
         df_res['현재가'] = df_res['현재가'].apply(lambda x: f"{x:,.2f}")
         
-        # 최종 열 배치 (이름 우측에 순수모멘텀스코어 배치)
         cols_order = [
             f"{type_name}", "순수모멘텀스코어", "조정 모멘텀 순위", 
             "스퀴즈", "BB(50,2)돌파", "돈키언(50)돌파", "저변동돌파", 
@@ -770,7 +760,6 @@ def check_inverse_hs_pattern(df):
     vol_ratio = vol_recent / vol_prev if vol_prev > 0 else 1.0
     return True, {"Neckline": f"{max_R:,.0f}", "Breakout": "Ready" if curr_close < max_R else "Yes", "Vol_Ratio": f"{vol_ratio:.1f}배"}
 
-# [UPDATE] 나침판 로직 수정
 def get_compass_signal():
     OFFENSE = ["QQQ", "SCHD", "IMTM", "GLD", "EMGF"]
     CASH = "BIL"
@@ -782,7 +771,6 @@ def get_compass_signal():
     except:
         return None, "다운로드 실패"
 
-    # BBW 계산
     bbw_dict = {}
     for ticker in OFFENSE:
         try:
@@ -828,23 +816,18 @@ def get_compass_signal():
     if not scores: return None, "계산 불가"
 
     df_scores = pd.DataFrame(scores).T
-    
-    # [UPDATE] 1) 순수 모멘텀 스코어 기준 내림차순 정렬
     df_scores = df_scores.sort_values("순수모멘텀스코어", ascending=False)
     
-    # [UPDATE] 2) 조정 모멘텀 순위 변환
     total_count = len(df_scores)
     df_scores['rank_temp'] = df_scores['최종스코어_raw'].rank(method='min', ascending=False)
     df_scores['조정 모멘텀 순위'] = df_scores['rank_temp'].apply(lambda x: f"{int(x)}/{total_count}")
     
-    # 추천 로직용 변수
     best_ticker = df_scores.index[0]
     best_score_pure = df_scores.iloc[0]['순수모멘텀스코어']
     best_trend = df_scores.iloc[0]['12M_Trend']
     
     final_position = best_ticker if (best_score_pure > 0 and best_trend > 0) else CASH
     
-    # 표에 렌더링하기 위한 데이터 정리
     df_scores['순수모멘텀스코어'] = df_scores['순수모멘텀스코어'].apply(lambda x: f"{x:.2f}")
     df_scores['12M_Trend'] = df_scores['12M_Trend'].apply(lambda x: f"{x*100:.1f}%")
     df_display = df_scores[["순수모멘텀스코어", "조정 모멘텀 순위", "12M_Trend"]].copy()
@@ -852,22 +835,17 @@ def get_compass_signal():
     
     return df_display, final_position
 
-# ==========================================
-# [NEW] 한국 상장 ETF 모멘텀 분석 로직 (병렬 수집)
-# ==========================================
 def fetch_korean_etf_data(ticker, name):
     time.sleep(random.uniform(0.05, 0.25))
     url = f"https://finance.naver.com/item/coinfo.naver?code={ticker}"
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     
-    # [UPDATE] 3) 한국 ETF 일봉 데이터를 통한 스퀴즈, BB돌파, 돈키언돌파 계산
     curr_bbw = 0.001
     squeeze_val = "-"
     bb_bk_val = "-"
     dc_bk_val = "-"
     
     try:
-        # 지표 계산에 필요한 넉넉한 일봉 데이터 수집 (260일)
         df_daily = fdr.DataReader(ticker).tail(260) 
         if len(df_daily) >= 60:
             df_ind = calculate_daily_indicators(df_daily)
@@ -875,11 +853,9 @@ def fetch_korean_etf_data(ticker, name):
                 curr_row = df_ind.iloc[-1]
                 c_series = df_ind['Close']
                 
-                # BBW 세팅
                 if curr_row['BW50'] > 0:
                     curr_bbw = curr_row['BW50']
                     
-                # 스퀴즈 & 돌파 로직
                 squeeze_on = df_ind['TTM_Squeeze'].iloc[-5:].any() if 'TTM_Squeeze' in df_ind.columns else False
                 squeeze_val = "🔥" if squeeze_on else "-"
                 
@@ -917,9 +893,9 @@ def fetch_korean_etf_data(ticker, name):
             '1M_Return(%)': ret_1m, '3M_Return(%)': ret_3m,
             '6M_Return(%)': ret_6m, '12M_Return(%)': ret_12m,
             'BBW': curr_bbw,
-            '스퀴즈': squeeze_val,          # [UPDATE] 추가
-            'BB(50,2)돌파': bb_bk_val,   # [UPDATE] 추가
-            '돈키언(50)돌파': dc_bk_val  # [UPDATE] 추가
+            '스퀴즈': squeeze_val,          
+            'BB(50,2)돌파': bb_bk_val,   
+            '돈키언(50)돌파': dc_bk_val  
         }
     except Exception as e:
         return {
@@ -957,7 +933,6 @@ def run_korean_etf_analysis():
     
     df_returns = pd.DataFrame(results)
     
-    # 1) 스코어 계산
     df_returns['순수모멘텀스코어_raw'] = (
         0.5 * (df_returns['12M_Return(%)'] + df_returns['6M_Return(%)']) 
         - df_returns['3M_Return(%)'] 
@@ -965,41 +940,29 @@ def run_korean_etf_analysis():
     )
     df_returns['최종모멘텀스코어_raw'] = df_returns['순수모멘텀스코어_raw'] / df_returns['BBW']
     
-    # [UPDATE] 1) 순수 모멘텀 스코어 기준 정렬
     df_returns = df_returns.dropna(subset=['순수모멘텀스코어_raw']).sort_values(by='순수모멘텀스코어_raw', ascending=False).reset_index(drop=True)
     
-    # [UPDATE] 2) 조정 모멘텀 순위 생성
     total_count = len(df_returns)
     df_returns['rank_temp'] = df_returns['최종모멘텀스코어_raw'].rank(method='min', ascending=False)
     df_returns['조정 모멘텀 순위'] = df_returns['rank_temp'].apply(lambda x: f"{int(x)}/{total_count}")
     
-    # [UPDATE] 4) 저변동돌파(매수발생) 로직
     def check_buy_signal(row):
         is_top_25 = row['rank_temp'] <= (total_count * 0.25)
         is_breakout = (row['BB(50,2)돌파'] == 'O') or (row['돈키언(50)돌파'] == 'O')
         return "🚨매수발생" if (is_top_25 and is_breakout) else "-"
 
     df_returns['저변동돌파'] = df_returns.apply(check_buy_signal, axis=1)
-    
-    # 포맷팅 정리
     df_returns['순수모멘텀스코어'] = df_returns['순수모멘텀스코어_raw'].apply(lambda x: f"{x:.2f}")
     
-    # 열 순서 배치
     cols_order = [
         'Symbol', 'Name', '순수모멘텀스코어', '조정 모멘텀 순위', 
         '스퀴즈', 'BB(50,2)돌파', '돈키언(50)돌파', '저변동돌파',
         '1M_Return(%)', '3M_Return(%)', '6M_Return(%)', '12M_Return(%)'
     ]
     
-    # 누락된 칼럼 에러 방지를 위해 존재하는 열만 선택
     final_cols = [c for c in cols_order if c in df_returns.columns]
-    
     return df_returns[final_cols]
 
-
-# ==========================================
-# [NEW] 듀얼 MA 돌파 (Phase 1, 3) 스크리닝 알고리즘 (0->1, 2->3 단계 전환만 추적)
-# ==========================================
 def check_dual_ma_breakout(df):
     if len(df) < 250: return False, None
     df = df.copy()
@@ -1012,17 +975,14 @@ def check_dual_ma_breakout(df):
     df['Trend_Up'] = df['EMA200'] > df['EMA200'].shift(20)
     df['Is_Squeezed'] = df['Gap_Pct'] <= 5.0
 
-    # Phase 0: 5일 연속 수렴 계산 (기존 10일에서 5일로 단축)
     df['Squeeze_5d'] = df['Is_Squeezed'].rolling(window=5).sum() == 5
 
-    # 특정 시점(idx)의 Phase 상태를 반환하는 내부 헬퍼 함수
     def get_phase(idx):
         if idx < 50: return "대기/눌림목"
         curr = df.iloc[idx]
         is_breakout = curr['Close'] > curr['DC_High']
         
         if is_breakout:
-            # Phase 1 검사: 최근 5일 이내에 수렴 5일 + 추세 조건이 있었는가?
             phase1_candidate = False
             for i in range(idx - 5, idx):
                 if df['Trend_Up'].iloc[i] and df['Squeeze_5d'].iloc[i]:
@@ -1031,7 +991,6 @@ def check_dual_ma_breakout(df):
             if phase1_candidate:
                 return "Phase 1"
 
-            # Phase 3 검사: 과거에 Phase 1이 발생했고, 20일선 안 깨고 재돌파인가?
             for i in range(idx - 40, idx - 4):
                 was_squeezed_and_trend = df['Squeeze_5d'].iloc[i-1] and df['Trend_Up'].iloc[i-1]
                 was_breakout_past = df['Close'].iloc[i] > df['DC_High'].iloc[i]
@@ -1042,44 +1001,197 @@ def check_dual_ma_breakout(df):
                         return "Phase 3"
                     break
             
-            # 1단계, 3단계 신규가 아니면 이미 돌파가 되어 상승 중인 상태임
             return "상승진행중"
             
         else:
-            # 돌파하지 않은 상태에서의 구분
             if df['Squeeze_5d'].iloc[idx] and df['Trend_Up'].iloc[idx]:
                 return "Phase 0 (수렴)"
-            return "대기/눌림목" # 2단계에 해당
+            return "대기/눌림목"
 
     curr_idx = len(df) - 1
     today_phase = get_phase(curr_idx)
 
-    # 오늘 상태가 Phase 1 또는 Phase 3 일 때만 추출
     if today_phase in ["Phase 1", "Phase 3"]:
         yest_phase = get_phase(curr_idx - 1)
         
-        # [핵심 변경] 전일 0단계 -> 당일 1단계, 또는 전일 2단계 -> 당일 3단계 인지 확인
         is_0_to_1 = (yest_phase == "Phase 0 (수렴)") and (today_phase == "Phase 1")
         is_2_to_3 = (yest_phase == "대기/눌림목") and (today_phase == "Phase 3")
 
-        # 두 조건 중 하나라도 만족할 때만 True 반환
         if is_0_to_1 or is_2_to_3:
             return True, {
                 "Today_Phase": today_phase + ("(1차 진입)" if today_phase == "Phase 1" else "(2차 불타기)"),
                 "Yest_Phase": yest_phase,
                 "Price": df.iloc[curr_idx]['Close'],
                 "EMA20": df.iloc[curr_idx]['EMA20'],
-                "Is_New": True # 필터를 통과했으므로 항상 신규 돌파임
+                "Is_New": True
             }
 
     return False, None
 
 
 # ==========================================
+# [NEW] 한국 주식 저변동모멘텀 분석 함수 (병렬 처리 적용)
+# ==========================================
+def fetch_korean_stock_data(ticker, name, group, marcap, start_date):
+    try:
+        df = fdr.DataReader(ticker, start_date)
+        if len(df) < 250: return None
+        c = df['Close']
+
+        # BBW 계산
+        ma50 = c.rolling(window=50).mean()
+        std50 = c.rolling(window=50).std()
+        bbw = (4 * std50) / ma50
+
+        # 모멘텀 계산
+        m1 = c / c.shift(20) - 1
+        m3 = c / c.shift(60) - 1
+        m6 = c / c.shift(120) - 1
+        m12 = c / c.shift(250) - 1
+        mom_score = (m12 + m6) * 0.5 - m3 + m1
+
+        latest_bbw = bbw.iloc[-1]
+        latest_mom = mom_score.iloc[-1]
+
+        if pd.isna(latest_bbw) or pd.isna(latest_mom): return None
+
+        return {
+            '종목코드': ticker,
+            '종목명': name,
+            '그룹': group,
+            '시가총액': marcap,
+            'BBW': round(latest_bbw, 4),
+            '모멘텀': round(latest_mom, 4)
+        }
+    except:
+        return None
+
+def run_korean_stock_low_vol_momentum():
+    today = datetime.today()
+    start_date = (today - relativedelta(months=16)).strftime("%Y%m%d")
+
+    # 1. 시가총액 데이터 수집
+    st.info("🌐 네이버 증권에서 시가총액 및 종목 정보를 수집합니다... (약 10~20초 소요)")
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    market_cap_data = []
+
+    progress_scrape = st.progress(0)
+    for sosok in [0, 1]:  # 0: 코스피, 1: 코스닥
+        for page in range(1, 46):
+            # 프로그레스 바 업데이트
+            progress_ratio = ((sosok * 45) + page) / 90
+            progress_scrape.progress(min(progress_ratio, 1.0))
+            
+            url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page={page}"
+            try:
+                res = requests.get(url, headers=headers, timeout=5)
+                soup = BeautifulSoup(res.text, 'html.parser')
+                table = soup.find('table', {'class': 'type_2'})
+                if not table: break
+
+                rows = table.find_all('tr')
+                added = False
+                for row in rows:
+                    cols = row.find_all('td')
+                    if len(cols) >= 7 and cols[1].find('a'):
+                        try:
+                            ticker = cols[1].find('a')['href'].split('code=')[-1]
+                            name = cols[1].text.strip()
+                            marcap_str = cols[6].text.replace(',', '').strip()
+                            if not marcap_str: continue
+                            marcap = int(marcap_str) * 100000000
+                            market_cap_data.append({'Ticker': ticker, '종목명': name, '시가총액': marcap})
+                            added = True
+                        except: continue
+                if not added: break
+            except: pass
+
+    progress_scrape.empty()
+    if not market_cap_data:
+        st.error("데이터 수집에 실패했습니다. 네이버 금융 연결 상태를 확인해주세요.")
+        return pd.DataFrame(), pd.DataFrame()
+
+    df_market = pd.DataFrame(market_cap_data).set_index('Ticker')
+
+    def assign_group(marcap):
+        if marcap >= 1500000000000: return '대형'
+        elif marcap >= 600000000000: return '중형'
+        elif marcap >= 400000000000: return '하단'
+        else: return None
+
+    df_market['그룹'] = df_market['시가총액'].apply(assign_group)
+    target_df = df_market[df_market['그룹'].notna()].copy()
+    
+    st.success(f"✅ 분석 대상: 총 {len(target_df)}개 종목 필터링 완료 (대형/중형/하단)")
+    st.info("🚀 종목별 과거 주가 수집 및 BBW/모멘텀을 계산합니다... (병렬 처리 중)")
+
+    # 2. 병렬로 주가 수집 및 지표 계산
+    tickers = target_df.index
+    results = []
+    
+    items_to_fetch = [(t, target_df.loc[t, '종목명'], target_df.loc[t, '그룹'], target_df.loc[t, '시가총액']) for t in tickers]
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    total = len(items_to_fetch)
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(fetch_korean_stock_data, t, n, g, m, start_date) for t, n, g, m in items_to_fetch]
+        for i, future in enumerate(concurrent.futures.as_completed(futures)):
+            res = future.result()
+            if res: results.append(res)
+            
+            if i % 10 == 0 or i == total - 1:
+                progress_bar.progress((i + 1) / total)
+                status_text.text(f"데이터 계산 중... ({i+1}/{total})")
+
+    progress_bar.empty()
+    status_text.empty()
+
+    if not results:
+        return pd.DataFrame(), pd.DataFrame()
+
+    final_df = pd.DataFrame(results)
+
+    # 3. 그룹별 모멘텀 컷오프 계산 및 판별
+    mom_thresholds = final_df.groupby('그룹')['모멘텀'].quantile(0.80).to_dict()
+
+    def determine_action(row):
+        group = row['그룹']
+        bbw = row['BBW']
+        mom = row['모멘텀']
+        q5_threshold = mom_thresholds.get(group, 0)
+
+        is_q5_momentum = (mom > 0) and (mom >= q5_threshold)
+
+        if is_q5_momentum:
+            if group == '대형' and (0.25 <= bbw <= 0.30): return "🎯 신규 매수 (확장 초입)"
+            elif group == '중형' and (0.10 <= bbw <= 0.15): return "🎯 신규 매수 (정석 눌림목)"
+            elif group == '하단' and (bbw < 0.10): return "🎯 신규 매수 (극도 수축/선취매)"
+
+        if group == '대형' and bbw >= 1.0: return "🔥 강력 홀딩 (추세 이탈 전까지 버티기)"
+        elif group == '중형' and bbw >= 0.8: return "🚨 분할 매도 (단기 과열 진입)"
+        elif group == '하단' and bbw >= 0.6: return "🚨 전량 매도 (슈팅 탈출 구간)"
+
+        return "관망"
+
+    final_df['상태'] = final_df.apply(determine_action, axis=1)
+    final_df = final_df.sort_values(by=['그룹', '시가총액'], ascending=[True, False])
+
+    buy_signals = final_df[final_df['상태'].str.contains('매수')]
+    sell_signals = final_df[final_df['상태'].str.contains('매도|홀딩')]
+
+    return buy_signals, sell_signals
+
+
+# ==========================================
 # 5. 메인 실행 화면
 # ==========================================
 
-tab_compass, tab1, tab2, tab3, tab4, tab5 = st.tabs(["🧭 나침판", "🌍 섹터", "🏳️ 국가", "📊 기술적 분석", "💰 재무분석", "📂 엑셀 데이터 매칭"])
+# [NEW] 탭 순서 변경 및 한국주식분석 탭 추가 (기술적 분석 옆)
+tab_compass, tab1, tab2, tab3, tab_korea, tab4, tab5 = st.tabs([
+    "🧭 나침판", "🌍 섹터", "🏳️ 국가", "📊 기술적 분석", "🇰🇷 한국주식분석", "💰 재무분석", "📂 엑셀 데이터 매칭"
+])
 
 with tab_compass:
     st.markdown("### 🧭 투자 나침판 (Smoothed Momentum Strategy)")
@@ -1124,7 +1236,7 @@ with tab_compass:
                 st.error(f"분석 실패: {position}")
 
 # -----------------------------------------------------------------------------
-# [탭 2] 섹터
+# [탭 1] 섹터
 # -----------------------------------------------------------------------------
 with tab1:
     cols = st.columns(12) 
@@ -1198,13 +1310,10 @@ with tab3:
 
                 if len(df) < 250: continue
 
-                # 1. 오늘 기준 VCP 체크
                 passed, info = check_vcp_pattern(df)
                 
-                # [핵심 변경] passed가 True이고, 비고(status)가 '4단계'를 포함할 때만 결과에 추가합니다.
                 if passed and "4단계" in info['status']:
-                    # 2. 어제 기준 VCP 체크 (오늘 데이터 제외하고 분석)
-                    df_prev = df.iloc[:-1].copy() # 마지막 행(오늘) 제외
+                    df_prev = df.iloc[:-1].copy() 
                     y_passed, y_info = check_vcp_pattern(df_prev)
                     prev_status = y_info['status'] if y_passed else "-"
 
@@ -1217,8 +1326,8 @@ with tab3:
                         '종목코드': final_ticker, 
                         '섹터': sector, 
                         '현재가': f"{info['price']:,.0f}",
-                        '비고': info['status'],       # 오늘의 단계 (무조건 4단계)
-                        '전일비고': prev_status,      # 어제의 단계
+                        '비고': info['status'],      
+                        '전일비고': prev_status,      
                         '주봉MACD': weekly_macd_status, 
                         '손절가': f"{info['stop_loss']:,.0f}", 
                         '목표가(3R)': f"{info['target_price']:,.0f}",
@@ -1234,7 +1343,6 @@ with tab3:
             if res:
                 df_res = pd.DataFrame(res)
                 
-                # 컬럼 순서 재배치
                 cols_order = [
                     '종목코드', '섹터', '현재가', '비고', '전일비고', 
                     '주봉MACD', '손절가', '목표가(3R)', '스퀴즈', 
@@ -1244,7 +1352,6 @@ with tab3:
                 
                 st.dataframe(df_res[final_cols], use_container_width=True)
                 
-                # 결과 리스트(res)에 있는 종목은 모두 4단계이므로 바로 차트를 그려줍니다.
                 if res:
                     st.markdown("---")
                     st.markdown("### 🚀 돌파 종목 차트 갤러리 (Step 4)")
@@ -1472,9 +1579,6 @@ with tab3:
                 save_to_supabase(res, "Integrated_Triple")
             else: st.warning("3가지 조건을 모두 만족하는 종목이 없습니다.")
 
-    # ==========================================
-    # [NEW] 듀얼 MA 돌파 (Phase 1, Phase 3 스크리닝) - 0->1단계, 2->3단계 전환만 추적
-    # ==========================================
     if cols[8].button("🔥 듀얼MA돌파"):
         tickers = get_tickers_from_sheet()
         if tickers:
@@ -1488,7 +1592,7 @@ with tab3:
                     sector = get_stock_sector(rt)
                     eps1w, eps1m, eps3m = get_eps_changes_from_db(rt)
                     res.append({
-                        '상태': "🚨당일신규돌파", # 이제 모든 결과가 신규 돌파임
+                        '상태': "🚨당일신규돌파", 
                         '종목코드': rt, '섹터': sector, '현재가': f"{info['Price']:,.0f}",
                         '전일Phase': info['Yest_Phase'], '당일Phase': info['Today_Phase'], 
                         '손절(EMA20)': f"{info['EMA20']:,.0f}",
@@ -1499,10 +1603,7 @@ with tab3:
             bar.empty()
             if res:
                 df_res = pd.DataFrame(res)
-                # 정렬: 1단계(1차 진입)가 위로 오도록 오름차순 정렬
                 df_res = df_res.sort_values(by=['당일Phase'], ascending=[True])
-                
-                # 출력에 필요한 컬럼만 추출 (전일Phase가 당일Phase 앞에 오도록 순서 변경)
                 display_cols = ['상태', '종목코드', '섹터', '현재가', '전일Phase', '당일Phase', '손절(EMA20)', '1W변화', '1M변화', '3M변화']
                 df_display = df_res[display_cols]
                 
@@ -1601,6 +1702,33 @@ with tab3:
                 st.dataframe(pd.DataFrame(res), use_container_width=True)
             else: st.warning("조건 만족 없음")
 
+# -----------------------------------------------------------------------------
+# [NEW] 탭 4: 한국주식분석 (저변동모멘텀)
+# -----------------------------------------------------------------------------
+with tab_korea:
+    st.markdown("### 🇰🇷 한국 주식 퀀트 스크리닝")
+    st.info("한국 주식 시장(KOSPI, KOSDAQ)의 시가총액을 그룹화하고, 모멘텀 상위 20% 종목 중 BBW를 만족하는 최적 타점 종목을 발굴합니다.")
+    
+    if st.button("📉 저변동모멘텀 분석 실행 (KOSPI/KOSDAQ 전체)"):
+        with st.spinner("한국 주식 데이터 수집 및 분석을 시작합니다. 잠시만 기다려주세요..."):
+            buy_df, sell_df = run_korean_stock_low_vol_momentum()
+
+            st.markdown("---")
+            st.markdown("#### 🟢 [매수 추천 종목] - 그룹별 모멘텀 상위 20% & 최적 BBW 도달")
+            if not buy_df.empty:
+                st.dataframe(buy_df, use_container_width=True)
+            else:
+                st.warning("⚠️ 오늘은 매수 조건(모멘텀 Q5 + 최적 BBW)을 만족하는 종목이 없습니다. (억지로 매매하지 않고 쉬는 것도 훌륭한 전략입니다!)")
+
+            st.markdown("#### 🔴 [보유 종목 익절/매도 경고 리스트] - 단기 과열 임계치 도달")
+            if not sell_df.empty:
+                st.dataframe(sell_df, use_container_width=True)
+            else:
+                st.info("🚨 현재 과열 경고 구간에 진입한 종목이 없습니다.")
+
+# -----------------------------------------------------------------------------
+# [탭 5, 6] 재무분석 및 엑셀 데이터 연동
+# -----------------------------------------------------------------------------
 with tab4:
     st.markdown("### 💰 재무 지표 분석 & EPS Trend (yfinance)")
     if st.button("📊 재무 지표 가져오기"):

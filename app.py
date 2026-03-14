@@ -4,13 +4,13 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime, timezone
-from dateutil.relativedelta import relativedelta  # [NEW] 날짜 계산용 추가
+from dateutil.relativedelta import relativedelta  # 날짜 계산용 추가
 from supabase import create_client, Client
 from scipy.signal import argrelextrema
 import time
 import re
 
-# [NEW] 한국 ETF 및 주식 스크래핑용 추가 라이브러리
+# 한국 ETF 및 주식 스크래핑용 추가 라이브러리
 import FinanceDataReader as fdr
 import requests
 from bs4 import BeautifulSoup
@@ -213,9 +213,9 @@ def save_to_supabase(data_list, strategy_name):
     rows_to_insert = []
     for item in data_list:
         rows_to_insert.append({
-            "ticker": str(item['종목코드']),
+            "ticker": str(item.get('종목코드', item.get('Symbol', '-'))),
             "sector": str(item.get('섹터', '-')),
-            "price": str(item['현재가']).replace(',', ''),
+            "price": str(item.get('현재가', '-')).replace(',', ''),
             "strategy": strategy_name,
             "high_date": str(item.get('현52주신고가일', '')), 
             "bw": str(item.get('BW_Value', '')), 
@@ -630,21 +630,18 @@ def analyze_momentum_strategy(target_list, type_name="ETF"):
     for i, (t, n) in enumerate(target_list):
         pbar.progress((i+1)/len(target_list))
         rt, df = smart_download(t, "1d", "2y")
-        if len(df)<50: continue # BBW를 위해 최소 50일 필요
+        if len(df)<50: continue
         
-        # 일봉 지표 전체 계산
         df_indicators = calculate_daily_indicators(df)
         if df_indicators is None: continue
         
         c = df['Close']; curr=c.iloc[-1]
         
-        # BBW(ema 50, 2) 계산
         ema50_bbw = c.ewm(span=50, adjust=False).mean()
         std50_bbw = c.rolling(window=50).std()
         bbw = (4 * std50_bbw) / ema50_bbw
         curr_bbw = bbw.iloc[-1]
         
-        # 0 나누기 방지
         if pd.isna(curr_bbw) or curr_bbw <= 0: 
             curr_bbw = 0.001
 
@@ -838,7 +835,7 @@ def get_compass_signal():
 def fetch_korean_etf_data(ticker, name):
     time.sleep(random.uniform(0.05, 0.25))
     url = f"https://finance.naver.com/item/coinfo.naver?code={ticker}"
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    headers = {'User-Agent': 'Mozilla/5.0'}
     
     curr_bbw = 0.001
     squeeze_val = "-"
@@ -1078,7 +1075,6 @@ def run_korean_stock_low_vol_momentum():
     progress_scrape = st.progress(0)
     for sosok in [0, 1]:  # 0: 코스피, 1: 코스닥
         for page in range(1, 46):
-            # 프로그레스 바 업데이트
             progress_ratio = ((sosok * 45) + page) / 90
             progress_scrape.progress(min(progress_ratio, 1.0))
             
@@ -1185,12 +1181,66 @@ def run_korean_stock_low_vol_momentum():
 
 
 # ==========================================
+# [NEW] 한국 ETF 저변동모멘텀 스크래핑 및 로직 함수
+# ==========================================
+def fetch_korean_etf_strategy2_data(ticker, name, start_date):
+    try:
+        df = fdr.DataReader(ticker, start_date)
+        if len(df) < 250: return None
+        c = df['Close']
+
+        ma50 = c.rolling(50).mean()
+        std50 = c.rolling(50).std()
+        upper50 = ma50 + (2 * std50)
+        bbw = (4 * std50) / ma50
+
+        m1 = c / c.shift(20) - 1
+        m3 = c / c.shift(60) - 1
+        m6 = c / c.shift(120) - 1
+        m12 = c / c.shift(250) - 1
+        mom_score = (m12 + m6) * 0.5 - m3 + m1
+
+        # 당일/전일 돌파 감지 (MA50 기준 & 백테스트용 BB상단 기준 모두 추출)
+        is_ma50_break_today = (c.iloc[-1] > ma50.iloc[-1]) and (c.iloc[-2] <= ma50.iloc[-2])
+        is_ma50_break_yest = (c.iloc[-2] > ma50.iloc[-2]) and (c.iloc[-3] <= ma50.iloc[-3])
+
+        is_bb_break_today = (c.iloc[-1] > upper50.iloc[-1]) and (c.iloc[-2] <= upper50.iloc[-2])
+        is_bb_break_yest = (c.iloc[-2] > upper50.iloc[-2]) and (c.iloc[-3] <= upper50.iloc[-3])
+
+        return {
+            '종목코드': ticker,
+            '종목명': name,
+            '현재가': c.iloc[-1],
+            '모멘텀': mom_score.iloc[-1],
+            'BBW': bbw.iloc[-1],
+            '당일돌파(MA50)': 'O' if is_ma50_break_today else 'X',
+            '전일돌파(MA50)': 'O' if is_ma50_break_yest else 'X',
+            '당일돌파(BB상단)': 'O' if is_bb_break_today else 'X',
+            '전일돌파(BB상단)': 'O' if is_bb_break_yest else 'X'
+        }
+    except:
+        return None
+
+def get_bbw_bin(bbw):
+    if bbw <= 0.060: return "D1"
+    elif bbw <= 0.077: return "D2"
+    elif bbw <= 0.094: return "D3"
+    elif bbw <= 0.114: return "D4"
+    elif bbw <= 0.133: return "D5"
+    elif bbw <= 0.158: return "D6"
+    elif bbw <= 0.190: return "D7"
+    elif bbw <= 0.236: return "D8"
+    elif bbw <= 0.324: return "D9"
+    else: return "D10"
+
+
+# ==========================================
 # 5. 메인 실행 화면
 # ==========================================
 
-# [NEW] 탭 순서 변경 및 한국주식분석 탭 추가 (기술적 분석 옆)
-tab_compass, tab1, tab2, tab3, tab_korea, tab4, tab5 = st.tabs([
-    "🧭 나침판", "🌍 섹터", "🏳️ 국가", "📊 기술적 분석", "🇰🇷 한국주식분석", "💰 재무분석", "📂 엑셀 데이터 매칭"
+# 탭 순서 변경 및 한국ETF분석 탭 추가
+tab_compass, tab1, tab2, tab3, tab_korea, tab_korea_etf, tab4, tab5 = st.tabs([
+    "🧭 나침판", "🌍 섹터", "🏳️ 국가", "📊 기술적 분석", "🇰🇷 한국주식분석", "🇰🇷 한국ETF분석", "💰 재무분석", "📂 엑셀 데이터 매칭"
 ])
 
 with tab_compass:
@@ -1703,7 +1753,7 @@ with tab3:
             else: st.warning("조건 만족 없음")
 
 # -----------------------------------------------------------------------------
-# [NEW] 탭 4: 한국주식분석 (저변동모멘텀)
+# 탭 4: 한국주식분석 (저변동모멘텀)
 # -----------------------------------------------------------------------------
 with tab_korea:
     st.markdown("### 🇰🇷 한국 주식 퀀트 스크리닝")
@@ -1725,6 +1775,107 @@ with tab_korea:
                 st.dataframe(sell_df, use_container_width=True)
             else:
                 st.info("🚨 현재 과열 경고 구간에 진입한 종목이 없습니다.")
+
+# -----------------------------------------------------------------------------
+# [NEW] 탭: 한국ETF분석 (저변동모멘텀돌파)
+# -----------------------------------------------------------------------------
+with tab_korea_etf:
+    st.markdown("### 🇰🇷 한국 ETF 저변동 모멘텀 분석")
+    st.markdown("""
+    <pre>
+===================================================================================================================
+ 🎯 [전략 2] ETF MA50 상향돌파(익일 시가) + 모멘텀 상위 25% + BBW(50,2) D1~D10 🎯
+===================================================================================================================
+BBW 분위수 (수치범위)          | 1M 승률(수익)        | 3M 승률(수익)        | 6M 승률(수익)        | 12M 승률(수익)       | 발생횟수
+-------------------------------------------------------------------------------------------------------------------
+D1(1분위) (0.00~0.06)     | 58% ( 0.0%)     | 62% ( 0.3%)     | 66% ( 3.1%)     | 66% ( 8.2%)     | 574회
+D2(2분위) (0.06~0.08)     | 55% ( 0.4%)     | 60% ( 1.7%)     | 57% ( 4.2%)     | 60% ( 8.7%)     | 574회
+D3(3분위) (0.08~0.09)     | 55% ( 0.7%)     | 61% ( 2.6%)     | 61% ( 5.8%)     | 62% (12.4%)     | 573회
+D4(4분위) (0.09~0.11)     | 64% ( 2.1%)     | 57% ( 1.8%)     | 55% ( 5.6%)     | 62% (15.8%)     | 574회
+D5(5분위) (0.11~0.13)     | 64% ( 4.1%)     | 56% ( 2.5%)     | 53% ( 7.1%)     | 57% (16.3%)     | 573회
+D6(6분위) (0.13~0.16)     | 64% ( 3.5%)     | 56% ( 2.8%)     | 51% ( 4.8%)     | 60% (15.6%)     | 574회
+D7(7분위) (0.16~0.19)     | 62% ( 2.7%)     | 59% ( 4.7%)     | 53% ( 7.6%)     | 53% (17.4%)     | 573회
+D8(8분위) (0.19~0.24)     | 62% ( 3.4%)     | 60% ( 5.7%)     | 50% ( 7.2%)     | 41% (15.0%)     | 574회
+D9(9분위) (0.24~0.32)     | 63% ( 3.8%)     | 66% ( 7.2%)     | 63% (15.5%)     | 42% (21.8%)     | 573회
+D10(10분위)(0.32~1.07)    | 66% ( 6.7%)     | 41% ( 9.3%)     | 27% (11.3%)     | 17% (25.2%)     | 574회
+===================================================================================================================
+    </pre>
+    """, unsafe_allow_html=True)
+
+    if st.button("저변동모멘텀돌파 (ETF)", type="primary"):
+        with st.spinner("한국 상장 ETF 전종목을 병렬로 스크래핑 및 분석 중입니다..."):
+            today = datetime.today()
+            start_date = (today - relativedelta(months=16)).strftime("%Y%m%d")
+
+            df_etf = fdr.StockListing('ETF/KR')
+            exclude_pattern = '단기자금|머니마켓|CD|KOFR|SOFR|파킹|전단채'
+            df_etf = df_etf[~df_etf['Name'].str.contains(exclude_pattern, regex=True, na=False)]
+
+            tickers = df_etf['Symbol'].tolist()
+            names = df_etf['Name'].tolist()
+            items = list(zip(tickers, names))
+            results = []
+
+            bar = st.progress(0)
+            status = st.empty()
+            total = len(items)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                futures = [executor.submit(fetch_korean_etf_strategy2_data, t, n, start_date) for t, n in items]
+                for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                    res = future.result()
+                    if res: results.append(res)
+                    if i % 10 == 0 or i == total - 1:
+                        bar.progress((i+1)/total)
+                        status.text(f"ETF 지표 연산 중... ({i+1}/{total})")
+
+            bar.empty()
+            status.empty()
+
+            if not results:
+                st.warning("분석 가능한 데이터를 가져오지 못했습니다.")
+            else:
+                df_res = pd.DataFrame(results)
+
+                valid_mom = df_res[df_res['모멘텀'] > 0]
+                if valid_mom.empty:
+                    st.warning("모멘텀이 양수인 종목이 없습니다.")
+                else:
+                    q75 = valid_mom['모멘텀'].quantile(0.75)
+                    
+                    # 1. 모멘텀 스코어 0 이상 & 상위 25% 필터링
+                    df_filtered = df_res[(df_res['모멘텀'] >= q75) & (df_res['모멘텀'] > 0)].copy()
+
+                    # 2. 돌파 여부 확인 (당일 또는 전일 돌파)
+                    df_filtered = df_filtered[
+                        (df_filtered['당일돌파(MA50)'] == 'O') | (df_filtered['전일돌파(MA50)'] == 'O') |
+                        (df_filtered['당일돌파(BB상단)'] == 'O') | (df_filtered['전일돌파(BB상단)'] == 'O')
+                    ].copy()
+
+                    if df_filtered.empty:
+                        st.warning("🚨 현재 모멘텀 상위 25% 중 상향 돌파를 완료한 종목이 없습니다.")
+                    else:
+                        df_filtered['BBW분위'] = df_filtered['BBW'].apply(get_bbw_bin)
+                        df_filtered['BBW(50,2)'] = df_filtered['BBW'].apply(lambda x: round(x, 4))
+                        df_filtered['모멘텀스코어'] = df_filtered['모멘텀'].apply(lambda x: round(x, 4))
+
+                        def get_remark(row):
+                            if row['BBW분위'] == "D9": return "🎯 최적돌파"
+                            elif row['BBW분위'] == "D10": return "🚨 단기과열(단타)"
+                            return "-"
+
+                        df_filtered['비고'] = df_filtered.apply(get_remark, axis=1)
+
+                        cols = [
+                            '종목코드', '종목명', '현재가', '모멘텀스코어', 
+                            '전일돌파(MA50)', '당일돌파(MA50)', 
+                            '전일돌파(BB상단)', '당일돌파(BB상단)', 
+                            'BBW(50,2)', 'BBW분위', '비고'
+                        ]
+                        df_display = df_filtered[cols].sort_values(by='모멘텀스코어', ascending=False)
+                        
+                        st.success(f"✅ 조건(모멘텀 상위 25% + 상향돌파)을 만족하는 ETF {len(df_display)}개를 발견했습니다!")
+                        st.dataframe(df_display, use_container_width=True)
 
 # -----------------------------------------------------------------------------
 # [탭 5, 6] 재무분석 및 엑셀 데이터 연동

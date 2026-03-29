@@ -4,7 +4,6 @@ import pandas as pd
 import numpy as np
 import pandas_datareader.data as web
 import datetime
-from IPython.display import display
 
 # 페이지 설정
 st.set_page_config(page_title="퀀트 투자 나침반", layout="wide")
